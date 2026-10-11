@@ -1444,6 +1444,15 @@ const ACT = {
   'weak-demo': () => { AI.saveWeak(STORE, DEMO_WEAK.reduce((l, w) => AI.upsertWeak(l, w), weakList())); renderDemo(); toast('데모 학습 기록을 불러왔어요. 실제 학습에서 생긴 기록이 아니에요.'); },
   'weak-clear': () => { AI.saveWeak(STORE, []); renderDemo(); toast('복습 목록을 비웠어요.'); },
   'speak-rec': () => toggleSpeak(),
+  'open-external': () => {
+    const url = AI.externalOpenUrl(INAPP, location.href);
+    if (url) { location.href = url; return; }
+    // iOS 의 일반 인앱: 웹페이지가 Safari 를 직접 열 수 없다. 링크를 복사하고 메뉴로 여는 법을 안내한다.
+    const msg = INAPP && INAPP.os === 'ios' ? "화면의 ⋯ 메뉴에서 'Safari로 열기'를 눌러 주세요." : "화면의 ⋮ 메뉴에서 '다른 브라우저로 열기'를 눌러 주세요.";
+    const done = ok => toast((ok ? '링크를 복사했어요. ' : '') + msg);
+    try { navigator.clipboard.writeText(location.href).then(() => done(true), () => done(false)); } catch (e) { done(false); }
+  },
+  'inapp-close': () => { $('#inapp-banner').hidden = true; try { sessionStorage.setItem('cd_inapp_closed', '1'); } catch (e) { /* 무시 */ } },
   'consent-withdraw': () => confirmBox('동의를 철회할까요?',
     `말하기 연습을 다시 쓰려면 새로 동의해야 해요. 이 브라우저에 저장된 복습 목록 ${weakList().length}개도 함께 지워요.`,
     '철회하고 지우기', () => {
@@ -1625,6 +1634,18 @@ renderSide();
    깨워 두면 첫 생성·말하기가 그 시간을 기다리지 않는다. 개인정보는 보내지 않는다. 사용자가 ?api= 로 지정한 외부 서버에는 부르지 않는다. */
 if (API.base !== null && !API.external) { try { fetch(API.base + '/health', { cache: 'no-store' }).catch(() => {}); } catch (e) { /* 폴백 전용 */ } }
 $('#demo-fab').hidden = MODE === 'product';
+/* 앱 안 브라우저(카톡·네이버·인스타그램 등) 안내 (사용자 테스트 P1·P2).
+   녹음·듣기가 막힐 수 있는데, 사용자는 '브라우저를 바꿔야 한다'는 생각을 못 하고 앱이 고장 난 줄 안다.
+   맨 위에 한 번 안내하고, 닫으면 이번 방문 동안은 다시 띄우지 않는다. 화면 렌더(render)와 따로 둔다. */
+const INAPP = AI.inAppBrowser(navigator.userAgent);
+function showInAppNotice() {
+  const el = $('#inapp-banner'); if (!el || !INAPP) return;
+  try { if (sessionStorage.getItem('cd_inapp_closed') === '1') return; } catch (e) { /* 저장소 막힘: 매번 안내 */ }
+  el.innerHTML = `<span class="ib-text"><b>${esc(INAPP.label)} 안에서 열었어요.</b> 듣기·말하기 기능은 Chrome 또는 Safari에서 열어야 동작해요.</span>
+    <span class="ib-acts"><button class="btn primary sm" data-act="open-external">브라우저에서 열기</button><button class="ib-close" data-act="inapp-close">닫기</button></span>`;
+  el.hidden = false;
+}
+showInAppNotice();
 render();
 /* index.html#u-home 처럼 주소 뒤에 화면 ID를 붙이면 그 화면으로 바로 열림 */
 if (SCR[location.hash.slice(1)]) navFromMenu(location.hash.slice(1));

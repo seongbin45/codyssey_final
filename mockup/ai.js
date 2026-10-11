@@ -18,6 +18,41 @@
   const str = v => typeof v === 'string' && v.trim().length > 0;
   const norm = v => String(v ?? '').trim().toLowerCase();
 
+  /* ---------- 앱 안 브라우저(인앱) 감지 ----------
+     카카오톡·네이버·인스타그램 등 앱 안에서 링크를 열면 녹음(MediaRecorder)·음성 재생이 막히는 경우가 있다
+     (사용자 테스트 P1: 카톡 링크로 열면 듣기·녹음이 안 됨). userAgent 로 알아보고 외부 브라우저로 여는 방법을 고른다.
+     반환: null(일반 브라우저) 또는 { app, os, label }. */
+  const INAPP = [
+    ['kakaotalk', /KAKAOTALK/i, '카카오톡'],
+    ['naver', /NAVER\(inapp/i, '네이버 앱'],
+    ['instagram', /Instagram/i, '인스타그램'],
+    ['facebook', /FBAN|FBAV|FB_IAB/i, '페이스북'],
+    ['line', /\bLine\//i, 'LINE'],
+    ['daum', /DaumApps/i, '다음 앱'],
+    ['band', /BAND\//, '밴드'],
+    ['everytime', /everytimeApp/i, '에브리타임'],
+  ];
+  function inAppBrowser(ua) {
+    ua = String(ua || '');
+    const os = /Android/i.test(ua) ? 'android' : /iPhone|iPad|iPod/i.test(ua) ? 'ios' : 'other';
+    for (const [app, re, label] of INAPP) if (re.test(ua)) return { app, os, label };
+    // 이름을 모르는 안드로이드 앱 내장 웹뷰 — Chrome 이 붙이는 '; wv)' 표시
+    if (os === 'android' && /;\s*wv\)/.test(ua)) return { app: 'webview', os, label: '앱' };
+    return null;
+  }
+  /* 외부 브라우저로 여는 주소. iOS 의 일반 인앱은 웹페이지가 Safari 를 직접 열 방법이 없어 null(링크 복사 안내). */
+  function externalOpenUrl(info, href) {
+    if (!info || !/^https?:\/\//i.test(String(href || ''))) return null;
+    if (info.app === 'kakaotalk') return 'kakaotalk://web/openExternal?url=' + encodeURIComponent(href);
+    if (info.app === 'line') { const u = new URL(href); u.searchParams.set('openExternalBrowser', '1'); return u.href; }   // 해시 앞(검색어)에 붙여야 LINE 이 읽는다
+    if (info.os === 'android') {
+      const u = new URL(href);
+      return 'intent://' + u.host + u.pathname + u.search + u.hash + '#Intent;scheme=' + u.protocol.replace(':', '') +
+        ';package=com.android.chrome;S.browser_fallback_url=' + encodeURIComponent(href) + ';end';
+    }
+    return null;
+  }
+
   /* ---------- 서버 주소 ----------
      ?api=https://host 는 이번 방문에서만 쓰고 저장하지 않는다. 녹음이 전송될 서버를 바꾸므로 external 로 알린다.
      http(s) 로 열렸으면 같은 출처(''), file:// 이면 null(폴백 전용). */
@@ -273,6 +308,7 @@
   const api = {
     WEAK_KEY, CONSENT_KEY, CONSENT_VERSION, loadConsent, saveConsent, withdrawConsent, WEAK_THRESHOLD, HEARD_MATCH_MIN, heardCoverage, MAX_AUDIO_BYTES, GEN_TIMEOUT_MS,
     categoryOfKind,
+    inAppBrowser, externalOpenUrl,
     apiBase, normalizeAiResponse, buildPools, takeForPlace, generateByCity,
     cleanWeak, upsertWeak, loadWeak, saveWeak, weakIdsFor, weakReviewOf, weakDecision, shouldSaveWeak, extFor, speakCheck,
   };

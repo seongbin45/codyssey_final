@@ -886,6 +886,13 @@ html[data-mode=legacy] .api-banner { display: none; }
 @media (min-width: 901px) { html[data-mode=legacy] .demo-fab { display: none; } }   /* 좁은 화면에서만 사이드 서랍 버튼 */
 .api-banner { background: var(--bad-soft); color: var(--on-bad-soft); font-size: 0.78125rem; padding: 8px var(--gutter); text-align: center; }
 .api-banner[hidden], .demo-fab[hidden] { display: none; }
+/* 앱 안 브라우저(카톡 등) 안내 — 녹음·듣기가 막힐 수 있어 외부 브라우저로 안내한다 (사용자 테스트 P1·P2) */
+.inapp-banner { background: var(--sun-soft); color: var(--on-sun-soft-2); border-bottom: 1px solid var(--sun-line);
+  padding: 10px var(--gutter); font-size: 0.875rem; line-height: 1.5; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.inapp-banner[hidden] { display: none; }
+.inapp-banner .ib-text { flex: 1 1 16rem; min-width: 0; word-break: keep-all; }
+.inapp-banner .ib-acts { display: flex; gap: 8px; flex: none; }
+.inapp-banner .ib-close { background: none; color: inherit; text-decoration: underline; padding: 0 4px; min-height: 34px; }
 
 /* 데모 서랍: 데모 모드에서 사이드 패널을 화면 밖 서랍으로 쓴다 */
 html[data-mode=demo] .side { position: fixed; inset: 0 auto 0 0; width: min(320px, 88vw); z-index: 200; transform: translateX(-102%); transition: transform .2s; }

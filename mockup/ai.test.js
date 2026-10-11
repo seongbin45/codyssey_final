@@ -290,3 +290,44 @@ test('저장소가 없거나(null) 차단돼도 학습 흐름이 죽지 않는�
   assert.equal(AI.saveConsent(null, true), false);
   assert.equal(AI.withdrawConsent(null), false);
 });
+
+test('inAppBrowser: 카톡·네이버·인스타 등 앱 안 브라우저를 알아본다 (사용자 테스트 P1)', () => {
+  const UA = {
+    kakaoAnd: 'Mozilla/5.0 (Linux; Android 13; SM-S918N Build/TP1A.220624.014; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/119.0.6045.163 Mobile Safari/537.36 KAKAOTALK/10.4.5 (INAPP)',
+    kakaoIos: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 KAKAOTALK 10.4.5',
+    naver: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 NAVER(inapp; search; 2000; 12.0.5; 15PRO)',
+    insta: 'Mozilla/5.0 (Linux; Android 14; SM-S921N; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/120.0 Mobile Safari/537.36 Instagram 312.0.0.32.112 Android',
+    fb: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 [FBAN/FBIOS;FBAV/440.0.0.33.116;]',
+    line: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Safari Line/13.18.0',
+    wv: 'Mozilla/5.0 (Linux; Android 12; Pixel 6; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/118.0 Mobile Safari/537.36',
+    chromeAnd: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+    safariIos: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1',
+    chromeIos: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/120.0.6099.119 Mobile/15E148 Safari/604.1',
+    samsung: 'Mozilla/5.0 (Linux; Android 14; SM-S921N) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/23.0 Chrome/115.0.0.0 Mobile Safari/537.36',
+    desktop: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  };
+  const app = k => (AI.inAppBrowser(UA[k]) || {}).app || null;
+  assert.equal(app('kakaoAnd'), 'kakaotalk'); assert.equal(AI.inAppBrowser(UA.kakaoAnd).os, 'android');
+  assert.equal(app('kakaoIos'), 'kakaotalk'); assert.equal(AI.inAppBrowser(UA.kakaoIos).os, 'ios');
+  assert.equal(app('naver'), 'naver');
+  assert.equal(app('insta'), 'instagram');
+  assert.equal(app('fb'), 'facebook');
+  assert.equal(app('line'), 'line');
+  assert.equal(app('wv'), 'webview');                       // 이름 모르는 안드로이드 앱 웹뷰
+  for (const k of ['chromeAnd', 'safariIos', 'chromeIos', 'samsung', 'desktop']) assert.equal(app(k), null, k);
+  assert.equal(AI.inAppBrowser(''), null);
+  assert.equal(AI.inAppBrowser(undefined), null);
+});
+
+test('externalOpenUrl: 앱마다 외부 브라우저로 여는 주소, iOS 일반 인앱은 null(복사 안내)', () => {
+  const href = 'https://codyssey-final.onrender.com/?x=1#u-home';
+  const k = AI.externalOpenUrl({ app: 'kakaotalk', os: 'ios' }, href);
+  assert.equal(k, 'kakaotalk://web/openExternal?url=' + encodeURIComponent(href));
+  assert.equal(AI.externalOpenUrl({ app: 'line', os: 'ios' }, href), 'https://codyssey-final.onrender.com/?x=1&openExternalBrowser=1#u-home');   // 해시 뒤가 아니라 검색어에
+  const intent = AI.externalOpenUrl({ app: 'instagram', os: 'android' }, href);
+  assert.ok(intent.startsWith('intent://codyssey-final.onrender.com/?x=1#u-home#Intent;scheme=https;package=com.android.chrome;'), intent);
+  assert.ok(intent.endsWith('S.browser_fallback_url=' + encodeURIComponent(href) + ';end'));
+  assert.equal(AI.externalOpenUrl({ app: 'instagram', os: 'ios' }, href), null);
+  assert.equal(AI.externalOpenUrl(null, href), null);
+  assert.equal(AI.externalOpenUrl({ app: 'kakaotalk', os: 'ios' }, 'file:///x/index.html'), null);   // 로컬 파일은 외부로 못 넘긴다
+});
