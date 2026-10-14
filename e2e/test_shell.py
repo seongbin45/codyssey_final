@@ -308,6 +308,15 @@ with sync_playwright() as p:
     check("일반 브라우저라도 녹음 API 가 없으면 기능 감지로 안내", page.locator("#inapp-banner").is_visible() and "녹음이 안 돼요" in page.locator("#inapp-banner").inner_text())
     ctx.close()
 
+    # 카톡에서 듣기만 안 되는 실제 사례(사용자 테스트 원인 확인): 말하기·카드는 된다고 알리고, 카톡 자체 메뉴를 안내
+    ctx = b.new_context(viewport={"width": 360, "height": 780}, user_agent=KAKAO_AND, has_touch=True, is_mobile=True)
+    page = ctx.new_page(); page.add_init_script("delete window.speechSynthesis;")
+    page.goto(BASE + "/"); page.wait_for_timeout(600)
+    bt = page.locator("#inapp-banner").inner_text() if page.locator("#inapp-banner").is_visible() else ""
+    check("카톡에서 듣기만 안 됨: '듣기가 안 돼요' + 카톡 메뉴 안내 + 말하기·카드는 된다고 알림",
+          "듣기(음성 재생)가 안 돼요" in bt and "다른 브라우저로 열기" in bt and "말하기와 카드 학습은 여기서도 돼요" in bt and "녹음이 안 돼요" not in bt, bt)
+    ctx.close()
+
     check("페이지 JS 오류 없음", not errors, "; ".join(errors))
     b.close()
 fail = [n for n, ok in results if not ok]

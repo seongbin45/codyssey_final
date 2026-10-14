@@ -542,7 +542,7 @@ function ttsState() {
 }
 const ttsText = s => s.replace(/\[name\]/g, 'your name').replace(/\[destination\]/g, 'your destination');
 function speak(text, btn) {
-  if (ttsState() !== 'ok') { toast('이 브라우저는 듣기를 지원하지 않아요. 카드 학습은 계속할 수 있어요.'); return; }
+  if (ttsState() !== 'ok') { toast('이 브라우저는 듣기를 지원하지 않아요. 말하기와 카드 학습은 계속할 수 있어요.'); return; }
   speechSynthesis.cancel();
   document.querySelectorAll('.playing').forEach(e => e.classList.remove('playing'));
   const u = new SpeechSynthesisUtterance(ttsText(text));
@@ -1056,7 +1056,7 @@ function studyView(r) {
   const ts = ttsState();
   const tts = ts === 'ok'
     ? `<div class="tts-row"><button class="tts-btn" data-act="speak-card">${I.speaker}듣기</button><button class="tts-rate" data-act="rate">${S.ttsRate < 0.9 ? '느리게' : '보통 속도'}</button></div>`
-    : `<div class="tts-off">이 브라우저는 듣기를 지원하지 않아요. 카드 학습은 계속할 수 있어요.</div>`;
+    : `<div class="tts-off">이 브라우저는 듣기를 지원하지 않아요. 말하기와 카드 학습은 계속할 수 있어요.</div>`;
   const inner = `<div class="app-pad">${head}${banner ? banner + '<div style="height:10px"></div>' : ''}
     <div class="flip ${S.card.back === S.card.i ? 'flipped' : ''}" data-act="flip">
       <div class="flip-inner">
@@ -1629,10 +1629,15 @@ function initInAppBanner() {
   try { if (sessionStorage.getItem('cd_inapp_closed') === '1') return; } catch (e) { /* 저장소 막힘: 매번 안내 */ }   // 닫으면 이번 방문 동안 다시 안 띄움
   const noRec = API.base !== null && !canRecord(), noTts = !ttsSupported();
   if (!info && !noRec && !noTts) return;                      // 일반 브라우저이고 기능도 다 되면 아무것도 띄우지 않는다
-  const lack = noRec && noTts ? '듣기와 녹음이' : noRec ? '녹음이' : noTts ? '듣기가' : '';
+  /* 안 되는 것만 말하고, 되는 것도 알려 준다 — "안 된다"만 보이면 앱이 고장 난 줄 알고 닫는다 (사용자 테스트 P2).
+     카카오톡에는 자체 '다른 브라우저로 열기' 메뉴가 있어 그쪽을 먼저 안내한다(우리 버튼보다 확실). */
   const who = info ? `${esc(info.name)} 안에서 열려 있어요. ` : '';
-  const msg = lack ? `<b>${who}이 브라우저에서는 ${lack} 안 돼요.</b> ${betterBrowser()}에서 열어 주세요.`
-                   : `<b>${who}</b>듣기·말하기가 안 되면 ${betterBrowser()}에서 열어 주세요.`;   // 기능은 있어 보이지만 앱 안 웹뷰는 실행 중 막힐 수 있다
+  const how = info && info.name === '카카오톡' ? `⋮ 메뉴에서 '다른 브라우저로 열기'를 눌러 주세요.` : `${betterBrowser()}에서 열어 주세요.`;
+  let msg;
+  if (noRec && noTts) msg = `<b>${who}이 브라우저에서는 듣기와 녹음이 안 돼요.</b> ${how}`;
+  else if (noTts) msg = `<b>${who}듣기(음성 재생)가 안 돼요.</b> ${how} 말하기와 카드 학습은 여기서도 돼요.`;
+  else if (noRec) msg = `<b>${who}녹음이 안 돼요.</b> ${how} 듣기와 카드 학습은 여기서도 돼요.`;
+  else msg = `<b>${who}</b>듣기·말하기가 안 되면 ${how}`;   // 기능은 있어 보이지만 앱 안 웹뷰는 실행 중 막힐 수 있다
   const open = info && info.scheme ? `<button type="button" data-inapp="open">브라우저에서 열기</button>` : '';
   el.innerHTML = `<span>${msg}</span>${open}<button type="button" data-inapp="copy">링크 복사</button><button type="button" data-inapp="close">닫기</button>`;
   el.hidden = false;
