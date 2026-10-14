@@ -8,14 +8,14 @@
 | 최근 세션 | `C:\Users\seong\.grok\sessions\C%3A%5CUsers%5Cseong%5CDesktop%5CProJect%5Ccodyssey_final\01a138a0-a233-7ca1-843c-3de2a5de06b6` |
 | 세션 파일 | `chat_history.jsonl`, `events.jsonl`, `updates.jsonl`, `summary.json`, `prompt_context.json`, `resources_state.json`, `system_prompt.txt`, `tool_definitions.json`, `terminal/` |
 | 작업 브랜치 | `docs/agent-workflow`. `origin/docs/agent-workflow`와 같다 (앞 0, 뒤 0) |
-| 조사 시점 `HEAD` | `2785bc5` — `docs/agent-workflow` |
+| 조사 시점 `HEAD` | `a1fa890` — `docs/agent-workflow` |
 | `origin` | `https://github.com/seongbin45/codyssey_final` |
 | `team` | `https://github.com/01044402345o-beep/codyssey_final.git` |
 | 배포 | `https://codyssey-final.onrender.com` (팀 `main` 머지 시 Render 무료 플랜) |
 
-이 읽기의 git 사실: `HEAD` `2785bc5`는 `origin/docs/agent-workflow`와 같다. 작업 트리에는 `mockup/styles.css` 수정과, 추적되지 않은 루트 `.gitignore`가 있다.
+이 읽기의 git 사실: `HEAD` `a1fa890`는 `origin/docs/agent-workflow`와 같다. 부모는 `2785bc5`. 제목은 `style(mockup): 디자인 가이드의 모서리·포커스·탭·안내 상자를 맞춘다`. 작업 트리는 `docs/ASSIGNMENT.md`(새 파일), `docs/REPO_STATE.md`, `docs/rubric.md`와 추적되지 않은 루트 `.gitignore`이다. `mockup/` 수정은 없다.
 
-`2785bc5`는 병합이다. 첫 부모는 `ad01d4a`(절차 문서), 둘째 부모는 `68ccfcc`이다. 제목은 `Merge fork main into docs/agent-workflow — 충돌은 PR 쪽 내용으로`이다.
+`2785bc5`는 병합이다. 첫 부모는 `ad01d4a`, 둘째 부모는 `68ccfcc`이다. 디자인 가이드를 맞춘 커밋은 `a1fa890`에서 멈춘다.
 
 로컬 `main`은 `origin/main`보다 44커밋 뒤이고, 앞은 0이다. 평가·배포 기준은 팀 저장소 `main`이다.
 
@@ -73,57 +73,55 @@
 | `codyssey_final/` | 오래된 사본. 루트에 없는 기능을 여기서 현재인 것처럼 가져오지 않는다 |
 | `transcribe_app/` | 범위 밖 |
 
+## 동결
+
+2026-10-14에 사용자가 정한 것이다.
+
+- 디자인 가이드 적용은 `a1fa890`에서 멈춘다.
+- `team`에는 푸시하지 않는다. 팀 저장소로는 나중에 PR을 연다.
+- `mockup/`은 2차 테스트가 끝나는 2026-10-22까지 동결이다.
+- 그때까지 저장소에서 할 일은 과제 원문 요건 확인이다. 2차 테스트에서 나온 버그만 고친다.
+
 ## 다음 구현 후보
 
-이번 세션은 디자인 가이드 v1(2026-10-08)이 적은 모서리·포커스·탭·안내 상자·비활성 투명도만 목업에 맞춘다. 아래는 그 다음이다.
+2026-10-22 전에는 아래를 구현하지 않는다.
 
-1. 가이드에 남아 있는 차이. 색 역할 이름과 잠긴 대비 색(이번 작업의 보류), 간격 6/10/11/13의 전부, 문구 다시 쓰기, 데모 크롬의 11px. 넓은 화면 모달 모서리는 아직 24가 아니다. 작은 버튼 모서리 10px는 가이드와 같다.
-2. FR-15. 예시 장소에 교통·숙소를 넣어 `categoryOfKind`가 그 계약을 실제로 호출하게 한다. 뉴욕·보스턴 장소 목록이 있거나, `data.js`와 같은 결의 예시 장소를 만들어도 된다는 확인이 필요하다.
+1. 디자인 가이드에 남아 있는 차이.
+2. FR-15. 예시 장소에 교통·숙소를 넣는 일.
+3. 2차 테스트 버그가 아닌 기능 추가.
 
 ## 사용자에게 요청할 파일
 
-트리에 이미 있어서 다시 받지 않는 것: `other/Project261000/design/`의 DC 세 파일, `docs/RESPONSIVE_STRATEGY.md`, `docs/requirements.md`.
+과제 원문은 받았다. 사용자가 적은 `C:\User\seong\Downloads\과제원문.html`은 없다. 같은 바이트는 `C:\Users\seong\Downloads\과제원문.html`과 작업 트리 `other/Project261000/resorce/과제원문.html`이다. sha256 `85b7eec5898e687b31528492e0522b97f730b8c7d1206d7808917500ae271fc7`. `git ls-files other`는 0건이다. 작업 트리 `.gitignore`가 `/other/`를 무시하고, 그 `.gitignore`는 커밋하지 않는다.
 
-다음에 구현하려면 필요한 것:
+아직 저장소에 없는 것:
 
-1. 2026-10-08보다 새로운 디자인 가이드가 있으면 그 파일. 없으면 현재 DC를 기준으로 쓴다.
-2. 다크 모드 팀 검수 메모나 화면 캡처. NFR-08이 이 검수를 미완으로 둔다.
-3. 실기기에서 깨진 화면이 있으면 그 캡처(기기, 브라우저, 화면 이름).
-4. 사용자는 디자인 가이드와 목업의 차이를 먼저 맞추기로 했다. FR-15 장소 목록은 이번 단계에 쓰지 않는다.
+1. 팀 6인에 대한 운영진 예외 승인. `docs/rubric.md`가 확인을 요구하고, 추적된 문서에는 승인이 없다.
+2. 2026-10-22 2차 테스트의 과업 성공률·설문. `docs/user-test/results.md`의 그 칸은 비어 있다.
 
 ## 이번 작업
 
-목적: `other/Project261000/design/디자인 가이드.dc.html`(v1, 2026-10-08)이 적은 모서리, 키보드 포커스, 탭, 안내 상자, 비활성 투명도를 `mockup/styles.css`에 맞춘다. 제품 동작과 잠긴 대비 색은 그대로 둔다.
-
-이 단계의 CSS는 아래 표를 이 문서에 적기 전에 작업 트리에 들어갔다. 그 편집이 파일을 CRLF로 바꿔 `tokens.test.js`가 토큰 블록을 읽지 못했다. LF로 되돌렸다. 포커스 링 투명도는 처음에 0.35와 0.45였고, 가이드의 0.18과 0.25로 고친 뒤에 대조를 맡긴다. 구현한 쪽은 이 단계를 통과로 적지 않는다.
+목적: 과제 원문(2026-10-07 저장, 프로젝트 143001)의 필수 문장을 `docs/ASSIGNMENT.md`에 고정하고, `docs/rubric.md`의 인용과 저장소 문서가 그 문장과 어디가 같은지 적는다. `mockup/`은 수정하지 않는다. `team`에는 푸시하지 않는다.
 
 | 단계 | 목적 | 파일 | 완료 조건 | 읽을 것 |
 |---|---|---|---|---|
-| 1 | 모서리·포커스·탭·안내 상자·비활성 투명도 | `mockup/styles.css` | 아래 체크리스트. `node --test mockup/tokens.test.js` 7개 통과. 파일은 LF | 디자인 가이드 v1, `mockup/styles.css`, `mockup/tokens.test.js`, `docs/RESPONSIVE_STRATEGY.md`의 대비 보류 |
-| 2 | 다른 에이전트가 1을 대조한다 | 위 파일과 가이드 | 불일치가 있으면 고친 뒤 같은 조건으로 다시 본다 | 단계 1과 같음 |
-| 3 | 검증 결과를 이 문서에 남기고, `styles.css`와 이 문서만 커밋한 뒤 `origin`의 `docs/agent-workflow`에 푸시한다 | git | `.gitignore`는 넣지 않는다. `team`과 `fix/dup-swipe`는 푸시하지 않는다 | 그 시점의 `git status`, `HEAD` |
+| 1 | 원문 필수 문장과 저장소 대응을 적는다 | `docs/ASSIGNMENT.md`, `docs/rubric.md`의 원문 출처 주석, 이 문서 | 아래 체크리스트 | 과제원문.html, `docs/rubric.md`, `README.md`, `docs/requirements.md`, `docs/user-test/results.md` |
+| 2 | 다른 에이전트가 1을 대조한다 | 위 파일과 원문 | 불일치가 있으면 고친 뒤 같은 조건으로 다시 본다 | 단계 1과 같음 |
+| 3 | 검증 결과를 이 문서에 남기고, 그 문서들만 커밋한 뒤 `origin`의 `docs/agent-workflow`에 푸시한다 | git | `.gitignore`와 `mockup/`과 `other/`는 넣지 않는다. `team`은 푸시하지 않는다 | 그 시점의 `git status`, `HEAD` |
 
 단계 1 체크리스트:
 
-- `--r`는 18px, `--r-lg`는 24px. 가이드 문장: 목업 12(입력·행) → 14, 16(카드) → 18, 22(히어로) → 24.
-- 라이트 `--focus`는 `#0f6b70`, `--focus-ring`은 `rgba(15, 107, 112, .18)`.
-- 다크 두 블록의 `--focus`는 `#4fb3b6`, `--focus-ring`은 `rgba(79, 179, 182, .25)`. 두 블록의 내용은 같다.
-- `.tabbar button`과 `.pnav button`은 글자 0.75rem, 색 `--text-soft`. 활성 아이콘은 `--accent`. `.pnav button` 모서리는 14px.
-- `.notice`는 모서리 14px, 안쪽 여백 12px 14px, 글자 0.9375rem, 줄간격 1.6, 아이콘 18px. `html:not([data-mode=legacy]) .notice`는 `--fs-body`이고, `--fs-small` 묶음에는 없다.
-- 모서리 14px: `.input`, `.add-city`, `.summary-strip > div`, `.cand-toggle`, `.srow`, `.sent`, `.toast`, `.split.coll .split-list .chips button`.
-- `.hero`와 `.flip-edge` 두 곳의 모서리는 24px. `.kind` 모서리는 6px.
-- `.gbtn:disabled, .btn:disabled`와 `.speak-btn:disabled`의 투명도는 .38.
-- 제품 입력칸 `:focus-visible`의 `outline-offset`은 2px.
-
-보류. 이번 단계에서 바꾸지 않는다.
-
-- `--bg` `#fbf8f1`, `--surface` `#ffffff`, `--bg-canvas` `#efe9dd`. 가이드는 이 이름에 다른 색을 붙인다. 테스트와 화면 배경은 지금 값을 잠근다.
-- 대비로 잠긴 색: `--accent-text`, `--text`, `--text-2`, `--text-3`, `--text-soft`, `--ok`, `--ok-text`, `--bad`, `--bad-text`, `--accent`, `--on-accent`. 다크 팔레트도 `--focus`와 `--focus-ring`만 바꾼다.
-- 칩 회색 네 가지를 `--chip` 하나로 합치지 않는다. 글자 크기 `clamp`는 유지한다. `app.js`, `index.html`, 루트 `.gitignore`는 건드리지 않는다.
-- 데모 크롬의 11px, 넓은 화면 모달 모서리, 문구 다시 쓰기, FR-15는 다음이다. `.btn.sm` 모서리 10px는 가이드의 작은 버튼과 같아서 둔다.
+- 원문 URL, 저장 시각, sha256, 두 경로가 같다는 사실, git에 없다는 사실이 있다.
+- 필수 문장을 원문 절 번호와 함께 인용한다. 4절 주제·기술 요소 5종·팀 인원, 6절 필수 요건·AI 윤리, 2절 배포 문장.
+- `docs/rubric.md` R1~R5 인용을 그 문장과 비교해, 같은 것과 글자가 다른 것을 구분한다.
+- 각 필수 항목이 어느 저장소 문서에 어떻게 적혀 있는지 파일 경로를 붙인다.
+- README 2절 이름이 6명이고, 예외 승인 문서는 없다는 내용이 있다.
+- README 9절은 실사용자 테스트가 예정이라고 하고, `docs/user-test/results.md`에는 P1~P5가 있다는 차이를 적는다.
+- Long-term Memory 원문 정의와 브라우저 저장 한계를 둘 다 적는다. 충족 여부를 이 문서가 확정하지 않는다.
+- 동결 네 줄이 이 문서에 있다.
+- `mockup/` diff가 없다.
 
 검증:
 
-- 단계 1 대조. 다른 에이전트가 통과라고 적었다. 체크리스트의 값이 `mockup/styles.css`에 있고, `node --test mockup/tokens.test.js`는 7개 모두 통과했고, 파일은 LF였다. 색 값 변경은 `--focus`와 `--focus-ring`뿐이었다. `app.js`, `index.html`, `.gitignore`는 diff에 없었다. 그때 이 절은 통과로 적혀 있지 않았다. 헤더는 `HEAD` `2785bc5`, `origin/docs/agent-workflow`와 앞 0 뒤 0, 첫 부모 `ad01d4a`, 둘째 부모 `68ccfcc`, 로컬 `main`은 `origin/main`보다 앞 0 뒤 44와 같았다.
-- 화면. `http://127.0.0.1:8769`에서 390px로 열었다. 라이트 `--focus` `#0f6b70`, 링 `rgba(15, 107, 112, .18)`, `--r` 18px, `--r-lg` 24px, 본문 배경 `rgb(251, 248, 241)`, `--surface` `#ffffff`. 히어로 24px, 카드 18px, 비활성 탭 12px이고 색은 `--text-soft`, 활성 아이콘은 `--accent`. 입력칸 14px·글자 16px, 포커스 윤곽은 `solid 2px rgb(15, 107, 112)`에 offset 2px. 안내 상자는 모서리 14px, 글자 15px, 줄간격 24px, 아이콘 18px. 종류 칩 6px, 일정 행 14px, 학습 카드 24px, `.flip-edge` 규칙 두 곳 모두 24px, 문장 14px, 비활성 버튼 투명도 0.38. 홈·입력·보고서·일정·학습·문장 모음에서 12px 미만 글자는 0. 다크 배경 `rgb(18, 21, 28)`, `--focus` `#4fb3b6`, 링 `rgba(79, 179, 182, .25)`, `--bg` `#12151c`.
-- `e2e/test_shell.py` 126/126. 320·390·768·1280, 라이트·다크, 터치 44px, 입력 16px, 12px 하한을 포함한다. 실기기 화면은 보지 않았다.
+- 단계 1 첫 대조: 불일치. 두 HTML의 sha256, URL, 저장 시각, R1·R4·R5 글자, R3의 빠진 "서비스", README 여섯 이름, 9절의 "예정", `results.md`의 P1~P5, 동결, `HEAD` `a1fa890`은 맞았다. 2절 기능 요구 명세서와 팀 문장, 4절 수행 문장이 원문보다 줄여 적혀 있었다.
+- 그 문장을 원문 그대로 고친 뒤 같은 단계 재대조: 다른 에이전트가 통과라고 적었다. 2절 표의 문장 37개가 원문 본문에 연속된 글자로 있다. `mockup/` 변경은 없다.
