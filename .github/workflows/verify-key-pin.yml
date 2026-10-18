@@ -32,7 +32,9 @@ jobs:
       - name: 검증 스크립트 가져오기
         env:
           GH_TOKEN: ${{ github.token }}
-          PIN_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+          # PR head sha 를 쓰지 않는다: 검증 코드를 PR 작성자가 공급하면 게이트를 스스로 무력화할 수 있다.
+          # 이 워크플로에는 pull_request 트리거가 없으므로 github.sha(= 트리거된 ref)만 쓴다.
+          PIN_REF: ${{ github.sha }}
         run: |
           set -euo pipefail
           mkdir -p .ci
@@ -41,11 +43,33 @@ jobs:
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/.github/scripts/verify_key_pin.py?ref=${PIN_REF}" \
             -o .ci/verify_key_pin.py
 
+      # 검증 코드 무결성: 스크립트를 저장소에서 런타임에 받아 실행하므로 해시를 고정한다.
+      # 미설정이면 **경고만**(가용성 우선 — 이 커밋 머지 직후부터 cron 이 계속 빨강이 되지 않게).
+      # 설정됐는데 불일치하면 fail-closed(exit 1). 값 등록 절차:
+      #   sha256sum .github/scripts/verify_key_pin.py
+      #   gh variable set EVIDENCE_CI_SCRIPT_SHA --body <위 해시> --repo <owner>/<repo>
+      # 스크립트를 고칠 때마다 이 변수를 갱신해야 한다(안 하면 다음 실행이 fail-closed 로 멈춘다).
+      - name: 검증 스크립트 무결성 대조(sha256)
+        env:
+          EVIDENCE_CI_SCRIPT_SHA: ${{ vars.EVIDENCE_CI_SCRIPT_SHA }}
+        run: |
+          set -euo pipefail
+          actual="$(sha256sum .ci/verify_key_pin.py | awk '{print $1}')"
+          if [ -z "${EVIDENCE_CI_SCRIPT_SHA:-}" ]; then
+            echo "::warning::vars.EVIDENCE_CI_SCRIPT_SHA 미설정 — 해시를 대조하지 않습니다(실제 sha256=$actual). 등록: gh variable set EVIDENCE_CI_SCRIPT_SHA --body $actual"
+          elif [ "$actual" != "$EVIDENCE_CI_SCRIPT_SHA" ]; then
+            echo "::error::검증 스크립트 sha256 불일치 — fail-closed(실제=$actual 기대=$EVIDENCE_CI_SCRIPT_SHA)"
+            exit 1
+          else
+            echo "검증 스크립트 sha256 일치: $actual"
+          fi
+
       # 기대값은 **Actions 변수**에서 읽는다(공개키·지문이라도 저장소 파일로는 두지 않는다).
-      # 변수가 비어 있으면 스크립트가 fail-closed 로 실패한다.
+      # 변수가 비면 스크립트가 fail-closed 로 실패한다(health_url 은 기본 호스트로 대체하지 않는다).
       - name: 런타임 지문·세대 대조
         run: |
           python3 .ci/verify_key_pin.py \
             --expected-fingerprint "${{ vars.EVIDENCE_PIN_FINGERPRINT }}" \
             --expected-generation "${{ vars.EVIDENCE_PIN_GENERATION }}" \
-            --health-url "${{ vars.EVIDENCE_PIN_HEALTH_URL || 'https://codyssey-final.onrender.com' }}"
+            --expected-key-id "${{ vars.EVIDENCE_PIN_KEY_ID }}" \
+            --health-url "${{ vars.EVIDENCE_PIN_HEALTH_URL }}"

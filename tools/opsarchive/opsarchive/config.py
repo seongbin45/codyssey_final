@@ -61,6 +61,21 @@ def config_dir() -> str:
     return os.path.join(os.path.expanduser("~"), ".opsarchive")
 
 
+def is_inside_repo(path: str) -> bool:
+    """경로가 **저장소 안**을 가리키는가(대소문자 무시).
+
+    공개 저장소에 핀을 두지 않는다는 결정을 한 곳에서 판정한다 — `read_settings` 의 자동 이전과
+    GUI 설정 저장 가드가 **같은 함수**를 써서 규칙이 갈라지지 않게 한다.
+    상대 경로는 `resolve` 로 저장소 루트 기준으로 푼 뒤 비교한다(작업 폴더에 흔들리지 않게).
+    형제 디렉터리(예: `codyssey_final_other`)는 접두가 같아도 `repo_abs + os.sep` 덕에 걸리지 않는다.
+    """
+    if not path:
+        return False
+    pin_abs = os.path.normcase(os.path.abspath(resolve(path)))
+    repo_abs = os.path.normcase(os.path.abspath(repo_root())) + os.sep
+    return pin_abs.startswith(repo_abs)
+
+
 def env_path() -> str:
     """`.env` 위치: 저장소 안 `tools/opsarchive/.env` 우선, 없으면 `~/.opsarchive/.env`."""
     local = os.path.join(tool_dir(), ENV_NAME)
@@ -137,10 +152,8 @@ def read_settings(path: str | None = None) -> dict[str, Any]:
         # CI 는 GitHub Actions 변수(`vars.EVIDENCE_PIN_*`)를 읽는다 — `opsarchive pin-publish` 로 올린다.
         data["pin_path"] = os.path.join(config_dir(), "evidence-key-pin.json")
     # 이전 판은 핀을 저장소 안(security/)에 두었다. 그 경로가 settings.json 에 남아 있으면 밖으로 옮긴다.
-    # 비교는 normcase(Windows 대소문자 무시)로 한다 — 소문자 경로로 다시 저장소 안을 가리키는 우회를 막는다.
-    pin_abs = os.path.normcase(os.path.abspath(str(data["pin_path"])))
-    repo_abs = os.path.normcase(os.path.abspath(repo_root())) + os.sep
-    if pin_abs.startswith(repo_abs):
+    # 판정은 `is_inside_repo`(normcase = Windows 대소문자 무시)로 한 곳에 모은다 — GUI 설정 가드와 같은 규칙.
+    if is_inside_repo(str(data["pin_path"])):
         data["pin_path"] = os.path.join(config_dir(), "evidence-key-pin.json")
     if not data.get("checkpoints_dir"):
         # 체크포인트는 관리자 자산이라 저장소 밖에 둔다(저장소 사본은 편의·감사용).

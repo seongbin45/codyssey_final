@@ -14,6 +14,10 @@
 
 환경변수
 - `EVIDENCE_PUBKEY` : 관리자 공개키(`x25519:<base64url>`). 없으면 이 기능 전체가 꺼진다(기본 꺼짐).
+- `EVIDENCE_SIGNING_PUBKEY` : 관리자 **서명 키**(Ed25519)의 공개 절반(`ed25519:<base64url>`,
+  `x25519:` 로 감싼 것도 허용 — CLI 핀이 그렇게 감싼다). 있으면 `/health` 에
+  `signing_fingerprint`(sha256 hex 64자)로 노출되어 CI/Actions 변수 `EVIDENCE_PIN_SIGNING_FINGERPRINT`
+  핀과 대조된다. **없거나 손상되면 필드를 넣지 않는다**(가짜 값 금지).
 - `EVIDENCE_KEY_GENERATION` : 회전 세대(기본 1). `/health` 로 노출되어 핀 검증에 쓰인다.
 - `EVIDENCE_GH_TOKEN` / `EVIDENCE_GH_REPO` : 이슈 통보용(없으면 보관만 하고 통보는 건너뛴다).
 - `EVIDENCE_MAX_BYTES` / `EVIDENCE_MAX_SOURCE_BYTES` / `EVIDENCE_MAX_LOGS_BYTES` : 하드 캡.
@@ -104,15 +108,61 @@ def fingerprint() -> str:
     return hashlib.sha256(key).hexdigest() if key else ""
 
 
+def signing_public_key() -> bytes | None:
+    """관리자 **서명 키**(Ed25519)의 공개 절반(32바이트). 없거나 손상되면 None.
+
+    봉투 키(`EVIDENCE_PUBKEY`, X25519)와 **용도가 다른 키**다 — 이 키는 체크포인트 서명용이다.
+    서명 키의 공개 절반은 비밀이 아니므로 `/health` 로 그 지문을 노출해 핀
+    (`EVIDENCE_PIN_SIGNING_FINGERPRINT`)과 대조한다. 값은 환경변수에서만 읽고 로그에 남기지 않는다.
+    """
+    raw = (os.getenv("EVIDENCE_SIGNING_PUBKEY") or "").strip()
+    if not raw:
+        return None
+    for prefix in ("x25519:", "ed25519:"):     # CLI 핀은 x25519: 로 감싼다(공개키 바이트는 같다)
+        if raw.startswith(prefix):
+            raw = raw[len(prefix):]
+            break
+    raw += "=" * (-len(raw) % 4)
+    try:
+        key = base64.urlsafe_b64decode(raw.encode())
+    except Exception:  # noqa: BLE001 — 값만 알린다(키 자체는 로그에도 남기지 않는다)
+        return None
+    return key if len(key) == 32 else None
+
+
+def signing_fingerprint() -> str:
+    """서명 키 공개 절반의 sha256 hex(64자 소문자). 없으면 "" — 가짜 값을 만들지 않는다.
+
+    `ssh-keygen -lf` 류의 사람용 표기가 아니라 **전체 sha256 hex** 다 — CLI `fingerprint()` 와
+    같은 규약이라 `EVIDENCE_PIN_SIGNING_FINGERPRINT` 와 문자열 그대로 비교할 수 있다.
+    """
+    key = signing_public_key()
+    return hashlib.sha256(key).hexdigest() if key else ""
+
+
 def generation() -> int:
     return _int_env("EVIDENCE_KEY_GENERATION", 1)
 
 
 def health_block() -> dict[str, Any]:
-    """`/health` 에 넣는 공개 정보 — 키 지문·세대만. 키 자체는 노출하지 않는다."""
+    """`/health` 에 넣는 공개 정보 — 키 지문·세대만. 키 자체는 노출하지 않는다.
+
+    기존 필드(`key_id`·`fingerprint`·`generation`)의 **이름·의미·형식은 바꾸지 않는다** — 운영 중
+    CI 와 GUI 가 그 이름에 의존한다. 서명 키가 설정되면 `signing_fingerprint` 를 **더한다**.
+    서명 키가 없거나 계산이 실패하면 **필드를 넣지 않는다**(가짜 값 금지) — 진단 필드가 `/health`
+    자체를 죽이면 안 되므로 예외는 삼키고 로그만 남긴다.
+    """
     if not configured():
         return {}
-    return {"key_id": key_id_hex(), "fingerprint": fingerprint(), "generation": generation()}
+    block = {"key_id": key_id_hex(), "fingerprint": fingerprint(), "generation": generation()}
+    try:
+        signing = signing_fingerprint()
+    except Exception:  # noqa: BLE001 — 진단 필드 하나가 엔드포인트를 죽이면 안 된다
+        LOGGER.warning("서명 키 지문 계산에 실패했습니다 — 필드를 생략합니다", exc_info=True)
+        signing = ""
+    if signing:
+        block["signing_fingerprint"] = signing
+    return block
 
 
 def seal(data: bytes, recipient: bytes) -> bytes:

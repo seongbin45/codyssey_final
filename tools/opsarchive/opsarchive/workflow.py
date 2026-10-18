@@ -77,6 +77,16 @@ NODES: list[dict] = [
     {"id": "pin_check", "label": "핀 대조", "group": "감시·증인", "kind": "action",
      "default": True, "desc": "핀 파일과 배포된 앱 /health 지문을 대조해 예상 밖 키를 잡는다.",
      "env": None, "requires": ["pin_path", "base_url"], "redeploy": False},
+    {"id": "pin_publish", "label": "핀 변수 발행", "group": "감시·증인", "kind": "action",
+     "default": True, "desc": "핀의 공개값을 GitHub Actions 변수(vars.EVIDENCE_PIN_*)로 올린다. "
+     "CI 가 읽는 값이라 **키를 회전했으면 반드시 갱신**해야 한다. 자동 실행 기본값은 꺼짐(수동)이다 — "
+     "'핀 변수 자동 발행' 을 켜야 자동 실행이 올린다.",
+     "env": None, "requires": ["pin_path", "repo"], "redeploy": False},
+    # 자동 실행 기본값은 꺼짐(수동): Actions 변수를 자동으로 덮어쓰면 조용한 변경(silent change)이 된다.
+    {"id": "pin_publish_enabled", "label": "핀 변수 자동 발행", "group": "감시·증인", "kind": "toggle",
+     "default": False, "desc": "자동 실행 루프가 핀을 Actions 변수로 올릴지. **기본 꺼짐(수동)** — "
+     "켜지 않으면 관리자가 [이 노드 실행] 으로만 올린다(변수를 조용히 덮어쓰지 않기 위해서다).",
+     "env": None, "requires": [], "redeploy": False},
     # -------------------------------------------------- 검증·앵커
     {"id": "anchor_interval", "label": "앵커 주기", "group": "검증·앵커", "kind": "choice",
      "default": "3600",
@@ -118,15 +128,16 @@ _BY_ID: dict[str, dict] = {node["id"]: node for node in NODES}
 _PLAN_ORDER: list[str] = [
     "seal_failures", "daily_cap", "per_uid_seconds", "ttl_days",
     "max_bytes", "key_generation", "include_secrets",
-    "observe", "pin_check", "iam_check_enabled", "iam_check", "anchor", "verify_chain",
+    "observe", "pin_check", "pin_publish", "pin_publish_enabled",
+    "iam_check_enabled", "iam_check", "anchor", "verify_chain",
     "anchor_interval", "issue_notify", "gh_repo", "client_report", "max_source_logs",
 ]
 
 # 로컬에서 실제로 실행 가능한 노드(run_step 이 처리한다).
-_RUNNABLE: set[str] = {"observe", "pin_check", "iam_check", "anchor", "verify_chain"}
+_RUNNABLE: set[str] = {"observe", "pin_check", "pin_publish", "iam_check", "anchor", "verify_chain"}
 # 값도 실행도 없이 안내만 하는 노드(env 없음).
 _INFO: set[str] = {"anchor_interval", "issue_notify", "gh_repo", "client_report", "max_source_logs",
-                   "iam_check_enabled"}
+                   "iam_check_enabled", "pin_publish_enabled"}
 
 # number 노드의 사람이 읽는 단위(선택).
 _UNITS: dict[str, str] = {"daily_cap": "회", "per_uid_seconds": "초", "ttl_days": "일",
@@ -142,6 +153,7 @@ _EDGES: list[tuple[str, str]] = [
     ("key_generation", "include_secrets"),
     ("include_secrets", "observe"),
     ("observe", "pin_check"),
+    ("pin_check", "pin_publish"),
     ("pin_check", "iam_check"),
     ("iam_check", "anchor"),
     ("anchor", "verify_chain"),
@@ -170,6 +182,9 @@ def _node(node_id: str) -> Optional[dict]:
 
 
 def _present(settings: dict, key: str) -> bool:
+    if key == "repo":
+        # Actions 변수 발행 대상 저장소: 설정의 gh_repo 또는 환경변수 EVIDENCE_GH_REPO 를 기본으로 쓴다.
+        return bool(settings.get("gh_repo") or os.environ.get("EVIDENCE_GH_REPO"))
     return settings.get(key) not in (None, "", False)
 
 
@@ -349,6 +364,7 @@ def _summarize(node_id: str, result: Any) -> dict:
     keys = {
         "observe": ("verdict", "ok", "observed", "attempts", "since_minutes", "note"),
         "pin_check": ("ok", "armed", "reasons", "pin_fingerprint"),
+        "pin_publish": ("repo", "uploaded", "empty", "dry_run"),
         "iam_check": ("verdict", "created", "delete_blocked", "update_blocked"),
         "anchor": ("seq", "count", "archives", "entries", "chain_ok", "head"),
         "verify_chain": ("ok", "count", "archives", "entries", "missing_now", "challenge_check", "note"),

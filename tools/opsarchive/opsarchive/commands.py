@@ -129,13 +129,57 @@ def _health_block(base_url: str) -> tuple[bool, str]:
     return False, ""
 
 
+def _poll_health_fingerprint(base_url: str, want: str, *, timeout: float, interval: float,
+                             step=None) -> tuple[bool, str, int]:
+    """배포 반영을 기다리며 /health 지문이 `want` 와 맞을 때까지 **짧게 폴링**한다.
+
+    왜 폴링하는가: publish 직후 ⑤ 는 종종 `match: False` 로 보였다 — 환경변수·재배포는 반영됐어도
+    런타임이 아직 새 지문을 들고 있지 않아서다(실제 GUI 로그에서 그랬다). 짧게 다시 확인한다.
+
+    - 각 시도는 기존 `_health_block` 을 그대로 쓴다 — **네트워크 실패/타임아웃은 기존처럼** `health_failed`
+      로 올린다(아직 성공한 읽기가 없을 때). 이미 읽은 값이 있으면 그 값으로 판정한다.
+    - 끝까지 안 맞으면 실패가 아니라 마지막 결과를 돌려준다(호출자가 경고·note 로 남긴다).
+    - `timeout` 상한이 있어 CLI 가 무한정 늘지 않는다(테스트는 0 으로 줄여 1회만 시도한다).
+
+    돌려주는 값: (지문을 노출했는가, 마지막 지문, 시도 횟수).
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    attempt = 0
+    has_evidence, fingerprint, got_reading = False, "", False
+    while True:
+        attempt += 1
+        try:
+            has_evidence, fingerprint = _health_block(base_url)
+            got_reading = True
+        except CommandError as exc:
+            if str(getattr(exc, "code", "")) != "health_failed":
+                raise
+            if not got_reading:
+                raise                       # 첫 시도부터 실패 = 기존과 같은 처리
+            break                          # 이미 읽은 값이 있으면 중간 실패로 발행을 실패시키지 않는다
+        if fingerprint == want:
+            break
+        if interval <= 0 or time.monotonic() >= deadline:
+            break
+        if step is not None:
+            step("⑤ /health 지문 대기 — 아직 새 배포가 반영되지 않았습니다(시도 %d, 최대 %ds)"
+                 % (attempt, int(timeout)))
+        time.sleep(min(float(interval), max(0.0, deadline - time.monotonic())))
+    return has_evidence, fingerprint, attempt
+
+
 def publish(service: str, key_file: str, passphrase: str, *, env_key: str = DEFAULT_ENV_KEY,
             api_key_value: str | None = None, redeploy: bool = True, base_url: str = "",
-            on_step=None, deploy_timeout: int = 300) -> dict:
+            on_step=None, deploy_timeout: int = 300, health_poll_timeout: float = 60,
+            health_poll_interval: float = 5) -> dict:
     """공개키를 Render 환경변수에 넣고 재배포한 뒤, 런타임 /health 의 지문과 대조한다.
 
     `on_step(문자열)` 을 주면 각 단계를 알려준다 — 재배포는 몇 분 걸리고 출력이 늦게 나오므로,
     진행 상황이 보이지 않으면 "응답 없음" 처럼 보인다(GUI 에서 실제로 그렇게 보였다).
+
+    ⑤ 는 `/health` 를 **짧게 폴링**한다(기본 총 60초·5초 간격). 배포 반영이 늦어 지문이 아직
+    안 맞아도 곧 맞는 경우가 흔하고, 그걸 `match: False` 로 실패처럼 보고하던 오탐을 없앤다.
+    끝까지 안 맞으면 실패가 아니라 `match: False` + `health_note`("배포 반영 대기일 수 있음")로 남긴다.
     """
     def step(message: str) -> None:
         if on_step is not None:
@@ -159,10 +203,20 @@ def publish(service: str, key_file: str, passphrase: str, *, env_key: str = DEFA
     applied = render.get_env(sid, env_key, api_key_value=api_key_value)
     result = {"service_id": sid, "key_id": C.key_id(public).hex(), "fingerprint": want,
               "env_set": bool(applied), "deploy": deploy_note, "health_has_evidence": False,
-              "health_fingerprint": "", "match": None}
+              "health_fingerprint": "", "match": None, "health_poll_attempts": 0}
     if base_url:
-        result["health_has_evidence"], result["health_fingerprint"] = _health_block(base_url)
-        result["match"] = (result["health_fingerprint"] == want)
+        has_evidence, fingerprint, attempts = _poll_health_fingerprint(
+            base_url, want, timeout=health_poll_timeout, interval=health_poll_interval, step=step)
+        result["health_has_evidence"] = has_evidence
+        result["health_fingerprint"] = fingerprint
+        result["health_poll_attempts"] = attempts
+        result["match"] = (fingerprint == want)
+        if result["match"]:
+            step("⑤ /health 지문 일치(시도 %d)" % attempts)
+        else:
+            result["health_note"] = "배포 반영 대기일 수 있음"
+            step("⑤ 경고: /health 지문이 아직 일치하지 않습니다 — 배포 반영 대기일 수 있음(시도 %d)"
+                 % attempts)
     return result
 
 

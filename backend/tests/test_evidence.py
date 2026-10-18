@@ -12,15 +12,28 @@ import base64
 import io
 import json
 import os
+import re
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(REPO_ROOT, "tools", "opsarchive"))
 from opsarchive import container as C          # noqa: E402 — 검증용(앱은 이 패키지를 쓰지 않는다)
+from opsarchive import pins as P                # noqa: E402 — 핀/Actions 변수 규약 실측용
 
 from app import evidence                        # noqa: E402
+
+
+def pack_ed25519(public: bytes) -> str:
+    """서명 키 공개 절반을 환경변수 문자열로 (`ed25519:<base64url(no padding)>`)."""
+    return "ed25519:" + base64.urlsafe_b64encode(public).decode().rstrip("=")
+
+
+def pack_x25519(public: bytes) -> str:
+    """CLI 핀이 서명 키를 감쌀 때 쓰는 표기(`x25519:` — `pins.make` 가 그렇게 쓴다)."""
+    return C.pack_public_key(public)
 
 
 class SealedCompatibilityTest(unittest.TestCase):
@@ -336,6 +349,164 @@ class VerifyErasedTest(unittest.TestCase):
         result = self.firebase_admin.verify_erased("uid-1")
         self.assertIsNone(result["ok"])
         self.assertEqual(result["error"], "verify_failed")
+
+
+class SigningFingerprintTest(unittest.TestCase):
+    """/health 의 evidence 블록이 **서명 키 지문**을 노출한다 — `EVIDENCE_PIN_SIGNING_FINGERPRINT` 핀과 대조.
+
+    확정 결함: 예전에는 `{key_id, fingerprint, generation}` 만 노출해 Actions 변수
+    `EVIDENCE_PIN_SIGNING_FINGERPRINT` 를 아무도 검증에 쓰지 못했고, 공격자가 서명 키를 교체해도
+    봉투 지문만 맞으면 통과했다. 이 테스트가 그 구멍을 막는다(서명 지문의 존재·형식·부재 규약).
+    """
+
+    def setUp(self):
+        evidence.reset_state()
+        self.env = mock.patch.dict(os.environ, {
+            "EVIDENCE_PUBKEY": C.pack_public_key(C.keypair()[1]),
+            "EVIDENCE_KEY_GENERATION": "5",
+        }, clear=False)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.addCleanup(evidence.reset_state)
+
+    def test_fingerprint_matches_the_cli_and_is_lowercase_hex_64(self):
+        """앱이 유도한 지문은 CLI `fingerprint()` 와 **문자열 그대로** 같아야 한다(형식 규약)."""
+        _, signing_public = C.sign_keypair()
+        with mock.patch.dict(os.environ, {"EVIDENCE_SIGNING_PUBKEY": pack_ed25519(signing_public)},
+                             clear=False):
+            app_fp = evidence.signing_fingerprint()
+            block = evidence.health_block()
+        self.assertEqual(app_fp, C.fingerprint(signing_public))
+        self.assertEqual(block["signing_fingerprint"], app_fp)
+        self.assertRegex(app_fp, r"^[0-9a-f]{64}$")            # 소문자 hex 64자
+        self.assertEqual(len(app_fp), 64)
+
+    def test_prefix_variants_yield_the_same_fingerprint(self):
+        """`ed25519:`·`x25519:`(CLI 핀 표기)·접두어 없는 base64url 이 모두 같은 지문을 준다."""
+        _, signing_public = C.sign_keypair()
+        bare = base64.urlsafe_b64encode(signing_public).decode().rstrip("=")
+        expected = C.fingerprint(signing_public)
+        for value in (pack_ed25519(signing_public), pack_x25519(signing_public), bare):
+            with mock.patch.dict(os.environ, {"EVIDENCE_SIGNING_PUBKEY": value}, clear=False):
+                self.assertEqual(evidence.signing_fingerprint(), expected, value[:12])
+
+    def test_app_fingerprint_equals_the_actions_variable_value(self):
+        """실측: `pin --sign-key` 가 만든 핀의 `signing_fingerprint_sha256`(→ Actions 변수 값)와
+        앱이 `/health` 로 보고하는 값이 **바이트 단위로 같아야** CI 대조가 성립한다."""
+        import tempfile
+        from opsarchive import commands
+        envelope_public = C.keypair()[1]
+        _, signing_public = C.sign_keypair()
+        pin = P.make(envelope_public, C.fingerprint(envelope_public), C.key_id(envelope_public).hex(),
+                     generation=5, health_url="https://example.test", signing_public=signing_public)
+        path = os.path.join(tempfile.mkdtemp(prefix="evidence-sign-pin-"), "evidence-key-pin.json")
+        P.write(path, pin)
+        actions_vars = commands.pin_variables(path)
+        # CLI 핀이 서명 공개키를 담는 표기(`x25519:`)를 그대로 앱 환경변수에 넣어도 같은 지문이 나온다.
+        with mock.patch.dict(os.environ,
+                             {"EVIDENCE_SIGNING_PUBKEY": pin["signing_public_key"]}, clear=False):
+            app_fp = evidence.health_block()["signing_fingerprint"]
+        self.assertEqual(app_fp, pin["signing_fingerprint_sha256"])
+        self.assertEqual(app_fp, actions_vars["EVIDENCE_PIN_SIGNING_FINGERPRINT"])
+        self.assertNotEqual(app_fp, "")                        # 빈 값(가짜 통과) 금지
+
+    def test_field_absent_when_signing_key_not_configured(self):
+        """서명 키가 없으면 필드를 넣지 않는다(가짜 값·빈 문자열도 금지)."""
+        with mock.patch.dict(os.environ, {"EVIDENCE_SIGNING_PUBKEY": ""}, clear=False):
+            block = evidence.health_block()
+        self.assertNotIn("signing_fingerprint", block)
+        # 기존 필드는 그대로다(회귀 방지): 이름·형식 불변
+        self.assertEqual(block["generation"], 5)
+        self.assertEqual(block["key_id"], evidence.key_id_hex())
+        self.assertRegex(block["fingerprint"], r"^[0-9a-f]{64}$")
+
+    def test_corrupted_signing_key_env_is_skipped_without_crashing(self):
+        """손상된 서명 키 환경변수 → 예외 없이 필드 생략, 기존 필드는 정상(요구 (d))."""
+        for bad in ("not-base64!!", "ed25519:zzzz", "deadbeef"):   # 잘린/비정상 32B 아님
+            with mock.patch.dict(os.environ, {"EVIDENCE_SIGNING_PUBKEY": bad}, clear=False):
+                self.assertEqual(evidence.signing_fingerprint(), "")
+                block = evidence.health_block()                # 예외를 올리지 않는다
+                self.assertNotIn("signing_fingerprint", block)
+                self.assertEqual(block["generation"], 5)
+                self.assertEqual(block["fingerprint"], evidence.fingerprint())
+
+    def test_existing_fields_names_and_formats_unchanged(self):
+        """요구 (c): key_id(16 hex)·fingerprint(64 hex)·generation(int) 의 이름·형식이 불변이다."""
+        with mock.patch.dict(os.environ,
+                             {"EVIDENCE_SIGNING_PUBKEY": pack_ed25519(C.sign_keypair()[1])},
+                             clear=False):
+            block = evidence.health_block()
+        self.assertRegex(block["key_id"], r"^[0-9a-f]{16}$")
+        self.assertRegex(block["fingerprint"], r"^[0-9a-f]{64}$")
+        self.assertIsInstance(block["generation"], int)
+        self.assertNotIn("public_key", block)                  # 공개키 바이트는 노출하지 않는다
+
+
+class SigningFingerprintEndpointTest(unittest.TestCase):
+    """/health 응답 전체 계약 — 서명 지문이 있을 때만 더해진다(라우트 수준 회귀 방지)."""
+
+    def test_endpoint_reports_signing_fingerprint_when_set(self):
+        from fastapi.testclient import TestClient
+        from app import main
+        _, envelope_public = C.keypair()
+        _, signing_public = C.sign_keypair()
+        with mock.patch.dict(os.environ, {
+            "EVIDENCE_PUBKEY": C.pack_public_key(envelope_public),
+            "EVIDENCE_KEY_GENERATION": "9",
+            "EVIDENCE_SIGNING_PUBKEY": pack_ed25519(signing_public),
+        }, clear=False):
+            body = TestClient(main.app).get("/health").json()
+        self.assertEqual(body["evidence"]["signing_fingerprint"], C.fingerprint(signing_public))
+        self.assertEqual(body["evidence"]["fingerprint"], C.fingerprint(envelope_public))
+        self.assertEqual(body["evidence"]["generation"], 9)
+
+    def test_endpoint_omits_signing_fingerprint_when_unset(self):
+        from fastapi.testclient import TestClient
+        from app import main
+        _, envelope_public = C.keypair()
+        with mock.patch.dict(os.environ, {
+            "EVIDENCE_PUBKEY": C.pack_public_key(envelope_public),
+            "EVIDENCE_SIGNING_PUBKEY": "",
+        }, clear=False):
+            body = TestClient(main.app).get("/health").json()
+        self.assertNotIn("signing_fingerprint", body["evidence"])
+        self.assertIn("fingerprint", body["evidence"])         # 봉투 지문 계약은 그대로
+
+
+class SigningKeySideEffectTest(unittest.TestCase):
+    """부작용 점검: 서명 키 환경변수는 봉인·영수증·탈퇴 경로에 영향을 주지 않아야 한다.
+
+    기존 커버: `ThrottleTest.test_seal_and_report_respects_throttle_and_never_raises`(저장 실패 삼킴),
+    `VerifyErasedTest.test_seal_failures_env_can_turn_it_off`(봉인 끄기), `VerifyErasedTest` 의
+    `verify_erased` 4건(탈퇴 사후 검증). 여기서는 **서명 키가 설정된 상태**에서 봉인·영수증이
+    그대로임을 고정한다(health_block 변경이 이 경로로 새지 않음을 확인).
+    """
+
+    def setUp(self):
+        evidence.reset_state()
+        self.addCleanup(evidence.reset_state)
+
+    def test_seal_and_receipt_unaffected_by_signing_key_env(self):
+        _, envelope_public = C.keypair()
+        _, signing_public = C.sign_keypair()
+        with mock.patch.dict(os.environ, {
+            "EVIDENCE_PUBKEY": C.pack_public_key(envelope_public),
+            "EVIDENCE_SIGNING_PUBKEY": pack_ed25519(signing_public),
+        }, clear=False), \
+                mock.patch.object(evidence, "store", return_value={"archive_id": "a", "size": 1,
+                                                                   "chunks": 1,
+                                                                   "expire_at": 0}) as store, \
+                mock.patch.object(evidence, "notify", return_value=True):
+            result = evidence.seal_and_report("erase_failed", uid="uid-sign")
+        self.assertTrue(result.get("enabled"))
+        # 봉인 문서에는 서명 지문·공개키가 새로 흘러들지 않는다(메타 계약 불변).
+        document = store.call_args.args[1]
+        self.assertNotIn("signing_fingerprint", document)
+        self.assertNotIn("signing_public_key", json.dumps(document))
+        # 영수증 계약(서명 없음)도 불변.
+        receipt = evidence.receipt_for("chal", {"seq": 1, "digest": "d", "created_at": 2}, "ok")
+        self.assertEqual(receipt["challenge"], "chal")
+        self.assertNotIn("signature", receipt)
 
 
 if __name__ == "__main__":

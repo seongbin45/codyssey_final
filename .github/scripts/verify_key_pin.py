@@ -39,6 +39,10 @@ def check(pin: dict, health: dict) -> list[str]:
     reasons = []
     if str(block.get("fingerprint", "")) != str(pin.get("fingerprint_sha256", "")):
         reasons.append("fingerprint_mismatch")
+    # key_id 는 기대값이 주어졌을 때만 대조한다(공백은 '미설정'으로 본다).
+    expected_key_id = str(pin.get("key_id", "")).strip()
+    if expected_key_id and expected_key_id != str(block.get("key_id", "")).strip():
+        reasons.append("key_id_mismatch")
     runtime_generation = block.get("generation")
     expected = pin.get("generation")
     if not isinstance(runtime_generation, int):
@@ -53,28 +57,48 @@ def check(pin: dict, health: dict) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="증거 봉인 키 핀 검증")
     parser.add_argument("pin", nargs="?", default="", help="핀 JSON 파일(저장소 밖). CI 는 쓰지 않는다")
-    parser.add_argument("--expected-fingerprint", default="",
+    parser.add_argument("--expected-fingerprint", default=None,
                         help="CI: Actions 변수 vars.EVIDENCE_PIN_FINGERPRINT")
-    parser.add_argument("--expected-generation", default="",
+    parser.add_argument("--expected-generation", default=None,
                         help="CI: Actions 변수 vars.EVIDENCE_PIN_GENERATION")
+    parser.add_argument("--expected-key-id", default=None,
+                        help="CI: Actions 변수 vars.EVIDENCE_PIN_KEY_ID(주어지면 /health 와 대조)")
     parser.add_argument("--health-url", default="", help="CI: Actions 변수 vars.EVIDENCE_PIN_HEALTH_URL")
     parser.add_argument("--health-file", default="", help="테스트용: /health JSON 파일")
     args = parser.parse_args(argv)
 
-    if args.expected_fingerprint or args.expected_generation:
-        # CI 경로: 기대값은 **Actions 변수**에서 온다(공개키·지문이라도 저장소에는 두지 않는다).
-        if not args.expected_fingerprint:
-            print("::error::Actions 변수 EVIDENCE_PIN_FINGERPRINT 가 비어 있습니다 — "
+    # 기대값 인자가 **하나라도 주어지면**(빈 문자열 포함) CI 경로다. default=None 이라
+    # '아예 안 줌'(파일 경로 분기)과 '빈 값으로 줌'(변수 미설정 → fail-closed)을 구분한다.
+    ci_mode = (args.expected_fingerprint is not None
+               or args.expected_generation is not None
+               or args.expected_key_id is not None)
+    if ci_mode:
+        # 기대값은 **Actions 변수**에서 온다(공개키·지문이라도 저장소에는 두지 않는다).
+        # 판정은 truthiness 가 아니라 **strip 기준**이다: " " 도 '미설정'으로 본다.
+        fingerprint = (args.expected_fingerprint or "").strip()
+        generation_raw = (args.expected_generation or "").strip()
+        key_id = (args.expected_key_id or "").strip()
+        health_url = (args.health_url or "").strip()
+        if not fingerprint:
+            print("::error::Actions 변수 EVIDENCE_PIN_FINGERPRINT 가 비어 있습니다(미설정) — "
                   "fail-closed 로 실패합니다(opsarchive pin-publish 로 올리세요)")
             return 1
-        try:
-            generation = int(args.expected_generation)
-        except ValueError:
-            print("::error::Actions 변수 EVIDENCE_PIN_GENERATION 이 숫자가 아닙니다 — fail-closed")
+        if not generation_raw:
+            print("::error::Actions 변수 EVIDENCE_PIN_GENERATION 이 비어 있습니다(미설정) — fail-closed")
             return 1
-        pin = {"armed": True, "fingerprint_sha256": args.expected_fingerprint,
-               "generation": generation,
-               "health_url": args.health_url or "https://codyssey-final.onrender.com"}
+        try:
+            generation = int(generation_raw)
+        except ValueError:
+            print("::error::Actions 변수 EVIDENCE_PIN_GENERATION 이 숫자가 아닙니다(%s) — fail-closed"
+                  % generation_raw)
+            return 1
+        if not health_url:
+            # 변수가 비었다고 기본 호스트로 대체하지 않는다 — 잘못된 호스트를 가릴 수 있다.
+            print("::error::health_url_missing: Actions 변수 EVIDENCE_PIN_HEALTH_URL 이 "
+                  "비어 있습니다(미설정) — fail-closed(기본 호스트로 대체하지 않습니다)")
+            return 1
+        pin = {"armed": True, "fingerprint_sha256": fingerprint, "key_id": key_id,
+               "generation": generation, "health_url": health_url}
     else:
         if not args.pin:
             print("::error::핀 파일 경로나 --expected-fingerprint 중 하나가 필요합니다")
@@ -91,8 +115,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     reasons = check(pin, health)
     if reasons:
-        print("::error::핀 검증 실패: %s (pin=%s runtime=%s)" % (
-            ", ".join(reasons), pin.get("fingerprint_sha256", "")[:16],
+        print("::error::핀 검증 실패(기대값과 다릅니다): %s (pin=%s runtime=%s)" % (
+            ", ".join(reasons), str(pin.get("fingerprint_sha256", ""))[:16],
             str((health.get("evidence") or {}).get("fingerprint", ""))[:16]))
         return 1
     print("핀 검증 통과: 세대 %s" % pin.get("generation"))
