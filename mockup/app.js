@@ -270,9 +270,12 @@ function sessionWrite() {
   const box = personalStore();
   if (!box || !SESS_READY || skipStateWrite) return;
   try {
+    /* 상황별 연습 중에는 S.card 가 연습용 값이다(date 가 'drill:…'라 sessionCard 가 null 로 만든다) — 그대로 저장하면
+       날짜별 학습 진도를 지운다. 연습이 빌려 가기 전의 카드(savedCard)를 저장하고, 새로고침하면 문장 모음으로 돌려보낸다. */
+    const drilling = !!(S.drill && S.drill.savedCard);
     box.setItem(SESSION_KEY, JSON.stringify({
-      v: SESSION_V, at: Date.now(), done: PROG.done, screen: S.screen, studyDate: S.studyDate,
-      card: sessionCard(S.card),
+      v: SESSION_V, at: Date.now(), done: PROG.done, screen: drilling ? 'u-coll' : S.screen, studyDate: S.studyDate,
+      card: sessionCard(drilling ? S.drill.savedCard : S.card),
     }));
   } catch (e) { /* 저장 불가(시크릿 모드·용량 초과): 이번 방문 동안만 유지 */ }
   scheduleStatePush();
