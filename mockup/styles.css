@@ -1168,10 +1168,14 @@ input[type="date"]::-webkit-datetime-edit { padding: 0; min-width: 0; }
 .flip-edge[data-first="1"] .fe-first { display: block; }
 .flip-edge[data-first="0"] .fe-last { display: block; }
 
-
-
-
-
+/* =====================================================================
+   문자열 내부의 줄바꿈(\n)을 화면에 그대로 반영합니다  (mockup/styles.css 맨 끝)
+   
+   ai 통역 화면에서 약관과 연결되는 자바스크립트 코드 mockup/app.js 에 있어요.
+   ===================================================================== */
+.live-notice {
+  white-space: pre-line; 
+}
 
 /* =====================================================================
    카드 좌우 스와이프 + 끝 카드 안내·그늘 — 붙여넣기용  (mockup/styles.css 맨 끝)
