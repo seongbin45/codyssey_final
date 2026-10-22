@@ -30,6 +30,7 @@ DEFAULTS: dict[str, Any] = {
     "checkpoints_dir": "",
     "pin_path": "",
     "tsa_url": "https://freetsa.org/tsr",
+    "kms_key": "",   # 자동 앵커용 Cloud KMS 서명 키 버전(선택) — docs/ops/KMS_AUTO_ANCHOR.md
 }
 
 
@@ -133,7 +134,15 @@ def read_settings(path: str | None = None) -> dict[str, Any]:
     if not data.get("key_dir"):
         data["key_dir"] = config_dir()
     if not data.get("pin_path"):
-        data["pin_path"] = os.path.join(repo_root(), "security", "evidence-key-pin.json")
+        # 핀은 **저장소 밖**에 둔다. 공개키·공개 지문이라도 공개 저장소에는 올리지 않는다.
+        # CI 는 GitHub Actions 변수(`vars.EVIDENCE_PIN_*`)를 읽는다 — `opsarchive pin-publish` 로 올린다.
+        data["pin_path"] = os.path.join(config_dir(), "evidence-key-pin.json")
+    # 이전 판은 핀을 저장소 안(security/)에 두었다. 그 경로가 settings.json 에 남아 있으면 밖으로 옮긴다.
+    # 비교는 normcase(Windows 대소문자 무시)로 한다 — 소문자 경로로 다시 저장소 안을 가리키는 우회를 막는다.
+    pin_abs = os.path.normcase(os.path.abspath(str(data["pin_path"])))
+    repo_abs = os.path.normcase(os.path.abspath(repo_root())) + os.sep
+    if pin_abs.startswith(repo_abs):
+        data["pin_path"] = os.path.join(config_dir(), "evidence-key-pin.json")
     if not data.get("checkpoints_dir"):
         # 체크포인트는 관리자 자산이라 저장소 밖에 둔다(저장소 사본은 편의·감사용).
         data["checkpoints_dir"] = os.path.join(config_dir(), "checkpoints")

@@ -202,6 +202,9 @@ with sync_playwright() as p:
     ctx = b.new_context(viewport={"width": 1280, "height": 800})
     page = ctx.new_page(); page.on("pageerror", lambda e: errors.append(str(e)))
     page.goto(BASE + "/#u-sched"); page.wait_for_timeout(700)
+    # 미래 날짜는 일정표를 여는 것만으로 창을 띄우지 않고, 오른쪽 상세 안에 '미리 학습하기'를 둔다
+    check("1280px 미래 날짜: 창 없이 상세 안에 '미리 학습하기'", page.evaluate("S.modal") is None and page.locator(".split-detail [data-act=preview-ok]").count() == 1)
+    page.locator(".split-detail [data-act=preview-ok]").click(); page.wait_for_timeout(300)
     check("1280px 일정표: 2열(목록+상세)", page.locator(".split-list .srow").count() >= 6 and page.locator(".split-detail .flip").count() == 1)
     check("1280px: 콘텐츠 열이 읽기 폭(640)보다 넓다", page.evaluate("document.querySelector('.pcol').getBoundingClientRect().width") > 800)
     check("1280px: 가로 스크롤 없음", hscroll(page) <= 0)
@@ -213,6 +216,8 @@ with sync_playwright() as p:
     check("선택 표시가 하나", page.locator(".srow.sel").count() == 1 and page.locator(".srow.sel").get_attribute("aria-current") == "true")
     check("목록 스크롤 위치 유지", abs(page.evaluate("document.querySelector('.split-list').scrollTop") - 260) <= 4, str(page.evaluate("document.querySelector('.split-list').scrollTop")))
     check("상세 머리글이 선택한 날짜", page.evaluate("document.querySelector('.split-detail .study-head b').textContent").replace(" ", "").startswith(page.evaluate("Dt.full(document.querySelector('.srow.sel').dataset.date)").replace(" ", "")[:5]))
+    if page.locator(".split-detail [data-act=preview-ok]").count():
+        page.locator(".split-detail [data-act=preview-ok]").click(); page.wait_for_timeout(300)
     page.locator(".split-detail .flip").click(); page.wait_for_timeout(300)
     check("카드 뒤집기가 2열에서도 동작(뒤집은 카드 1)", "뒤집은 카드 1" in page.locator("[data-live=flipcount]").inner_text())
     page.locator('.pnav button[data-id="u-study"]').click(); page.wait_for_timeout(300)
@@ -280,10 +285,11 @@ with sync_playwright() as p:
     ctx = b.new_context(viewport={"width": 360, "height": 780}, has_touch=True, is_mobile=True)
     page = ctx.new_page(); page.on("pageerror", lambda e: errors.append(str(e)))
     page.goto(BASE + "/#u-study"); page.wait_for_timeout(600)
+    page.evaluate("S.modal && S.modal.title === '아직 학습일이 아니에요' && ACT['modal-ok']()"); page.wait_for_timeout(200)   # 미래 날짜 확인 창
     page.locator(".flip").click(); page.wait_for_timeout(200)
     day = page.evaluate("({ date: S.card.date, i: S.card.i, n: S.card.flipped.size })")
     page.evaluate("navFromMenu('u-coll')"); page.wait_for_timeout(300)
-    check("문장 모음: 공통 상황 6묶음마다 '카드로 연습' 버튼", page.locator('[data-act="drill"]').count() == 6, str(page.locator('[data-act="drill"]').count()))
+    check("문장 모음: 공통 상황 6묶음 + 참고 '응급 전화'마다 '카드로 연습' 버튼", page.locator('[data-act="drill"]').count() == 7, str(page.locator('[data-act="drill"]').count()))
     check("문장 모음 360px: 버튼이 붙어도 가로 넘침 없음", hscroll(page) <= 0, str(hscroll(page)))
     page.locator('[data-act="drill"][data-v="airport"]').click(); page.wait_for_timeout(300)
     st = page.evaluate("({ scr: S.screen, ids: S.drill && S.drill.ids, cur: S.smap[pickRow().ids[S.card.i]].sit })")
@@ -301,7 +307,15 @@ with sync_playwright() as p:
     page.wait_for_timeout(700)
     check("상황별 연습: 왼쪽 스와이프 1회 = 카드 1장(1/5 → 2/5)", page.evaluate("S.card.i") == 1 and "2 / 5" in page.locator('[data-live="flipcount"]').inner_text(), page.locator('[data-live="flipcount"]').inner_text())
     page.locator(".flip").click(); page.wait_for_timeout(200)
-    check("상황별 연습: 카드 뒤집으면 뒷면에 말해보기 영역", page.locator('[data-live="speak"]').count() == 1)
+    check("상황별 연습: 뒷면에는 말해보기가 없고 하단에 '회화 연습 열기'",
+          page.locator('.face [data-live^="speak"], .face .speak-btn').count() == 0 and page.locator('[data-act="sheet-open"]').count() == 1)
+    page.locator('[data-act="sheet-open"]').click(); page.wait_for_timeout(300)
+    has_talk = page.evaluate("!!(curSent() && curSent().talk)")
+    check("회화 연습 시트: 말해보기 영역 + (공통 문장이면) 예상 답변",
+          page.locator('.sheet .talk-me [data-live="speak-btn"]').count() == 1   # 말해보기는 줄마다(듣기 옆) — 내 문장 줄은 반드시
+          and (page.locator('.sheet .talk-line').count() >= 2 if has_talk else page.locator('.sheet .talk-line').count() == 0), f"talk={has_talk}")
+    page.locator('[data-act="sheet-close"]').click(); page.wait_for_timeout(300)
+    check("회화 연습 시트 닫기", page.locator('.sheet').count() == 0 and not page.evaluate("S.sheet"))
     page.locator('.appbar .back').click(); page.wait_for_timeout(300)
     check("뒤로 → 문장 모음, 연습 묶음 해제", page.evaluate("S.screen") == "u-coll" and page.evaluate("S.drill") is None)
     back = page.evaluate("({ date: S.card.date, i: S.card.i, n: S.card.flipped.size })")
@@ -315,6 +329,15 @@ with sync_playwright() as p:
     page.locator('[data-act="drill"]').first.click(); page.wait_for_timeout(300)
     st = page.evaluate("({ scr: S.screen, by: S.drill && S.drill.date, all: S.drill && S.drill.ids.every(id => S.smap[id].placeId === S.drill.ids.map(i => S.smap[i].placeId)[0]) })")
     check("장소별 탭: 장소마다 연습 버튼, 누르면 그 장소 문장만", n > 0 and st["scr"] == "u-study" and st["all"], f"{n} {st}")
+    # 응급 전화(참고용, 사용자 설문 10/18): 연습은 되지만 날짜별 학습량(공통 30)에는 들어가지 않는다
+    page.locator('.appbar .back').click(); page.wait_for_timeout(300)
+    page.locator('[data-act="coll-tab"][data-v="common"]').click(); page.wait_for_timeout(300)
+    page.locator('[data-act="drill"][data-v="emergency_call"]').click(); page.wait_for_timeout(300)
+    st = page.evaluate("({ scr: S.screen, ids: S.drill && S.drill.ids, head: document.querySelector('.study-head').innerText,"
+                       " common: S.sents.filter(s => s.source === 'common').length, inSents: S.sents.some(s => s.sit === 'emergency_call'),"
+                       " inSched: S.sched.some(r => r.ids.some(id => id.startsWith('r-'))) })")
+    check("응급 전화 연습: 4문장 카드가 열림", st["scr"] == "u-study" and len(st["ids"]) == 4 and "응급 전화" in st["head"], str(st))
+    check("응급 전화: 일정 계산 대상(공통 30)·날짜 일정에 들어가지 않음", st["common"] == 30 and not st["inSents"] and not st["inSched"], str(st))
     ctx.close()
     ctx = b.new_context(viewport={"width": 1280, "height": 800})
     page = ctx.new_page(); page.on("pageerror", lambda e: errors.append(str(e)))

@@ -25,7 +25,7 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from . import commands, config, container as C, entropy, gcp, pins, render, workflow
+from . import commands, config, container as C, entropy, firebase, gcp, pins, render, users, workflow
 
 ENV_FIELDS = ["RENDER_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "EVIDENCE_GH_TOKEN",
               "EVIDENCE_GH_REPO"]
@@ -40,6 +40,7 @@ SETTING_FIELDS = [
     ("checkpoints_dir", "체크포인트 폴더"),
     ("pin_path", "핀 파일 경로"),
     ("tsa_url", "TSA 주소(선택)"),
+    ("kms_key", "KMS 서명 키(선택, projects/.../cryptoKeyVersions/N)"),
 ]
 
 
@@ -102,6 +103,9 @@ class App:
                 continue
             if tag == "status":
                 self.status_var.set(text)          # 메인 창 아래 상태 줄(로그 창이 닫혀 있어도 보인다)
+                continue
+            if tag == "users":
+                self._fill_users()                 # 워커가 불러온 사용자 목록·상세를 메인 스레드에서 반영
                 continue
             if tag == "services":
                 # 워커 스레드가 불러온 서비스 목록을 메인 스레드에서 창에 반영한다(Tk 규칙).
@@ -199,21 +203,30 @@ class App:
                 result = fn()
                 if isinstance(result, dict) and result.get("error"):
                     # rotate 처럼 "부분 성공 + error" 를 돌려주는 경우를 성공으로 보지 않는다.
-                    self.last[label] = "✘ " + str(result["error"])
+                    self.last[label] = "✘ " + str(result.get("_state") or result["error"])
                     self.log("✘ 실패: %s" % result["error"], "err")
                     for key, value in result.items():
-                        self.log("   %s: %s" % (key, value))
+                        if not key.startswith("_"):
+                            self.log("   %s: %s" % (key, value))
+                    self.log_queue.put(("status", "✘ %s: %s" % (label, result.get("_state") or result["error"])))
                     return
+                state = ""
                 if isinstance(result, dict):
+                    state = str(result.get("_state") or "")   # 성공이지만 덧붙일 상태(예: 배포됨·미확인)
                     for key, value in result.items():
-                        self.log("   %s: %s" % (key, value))
+                        if not key.startswith("_"):
+                            self.log("   %s: %s" % (key, value))
                 elif result:
                     self.log("   " + str(result))
-                self.last[label] = "✔ 완료"
+                self.last[label] = "✔ " + (state or "완료")
                 self.log("✔ 끝", "ok")
-                self.log_queue.put(("status", "✔ %s 완료" % label))
+                self.log_queue.put(("status", "✔ %s %s" % (label, state or "완료")))
             except Exception as exc:  # noqa: BLE001 — GUI 는 어떤 예외도 창을 닫지 않게
                 code = getattr(exc, "code", "")
+                if code == "no_pin_file":
+                    # 핀 파일이 아직 없을 때 "무엇을 먼저 해야 하는지"를 화면에 남긴다.
+                    code = "no_pin_file — Render 탭 ⑤ [핀 만들기] 를 먼저 실행하세요 (핀 파일: %s)" % (
+                        self.settings.get("pin_path") or "경로 미설정")
                 self.last[label] = "✘ 실패: " + str(code or type(exc).__name__)
                 self.log("✘ %s%s" % (type(exc).__name__, (": " + str(code)) if code else ""), "err")
                 self.log_queue.put(("status", "✘ %s 실패: %s" % (label, code or type(exc).__name__)))
@@ -308,6 +321,11 @@ class App:
         self.step_status.get("pin-check", tk.StringVar()).set(self.state("pin-check"))
         self.step_status.get("iam", tk.StringVar()).set(self.state("iam-check"))
         self.step_status.get("redeploy", tk.StringVar()).set(self.state("재배포"))
+        self.step_status.get("rules-status", tk.StringVar()).set(self.state("규칙 대조"))
+        self.step_status.get("rules-dry", tk.StringVar()).set(self.state("규칙 검사"))
+        self.step_status.get("rules-deploy", tk.StringVar()).set(self.state("규칙 배포"))
+        if getattr(self, "rules_info", None) is not None:
+            self.rules_info.set(self._rules_info_text())
         self._refresh_store_and_verify()
         self._update_hint()
 
@@ -368,6 +386,8 @@ class App:
         self._tab_settings(notebook)
         self._tab_keys(notebook)
         self._tab_render(notebook)
+        self._tab_rules(notebook)
+        self._tab_users(notebook)
         self._tab_store(notebook)
         self._tab_verify(notebook)
 
@@ -430,6 +450,7 @@ class App:
         self._button(bar, "정책에 저장", self.save_node)
         self._button(bar, "Render에 반영", self.push_node_env)
         self._button(bar, "이 노드 실행", self.run_node)
+        self._button(bar, "변경 모아 반영(재배포·확인)", self.apply_all_env)
 
         bar2 = ttk.Frame(frame)
         bar2.pack(fill="x", padx=10, pady=(0, 4))
@@ -542,7 +563,7 @@ class App:
         self.node_title.configure(text="%s  (%s)" % (node.get("label", ""), self.selected_node))
         extra = ""
         if node.get("env"):
-            extra = "\n서버 환경변수: %s%s" % (node["env"], " · 반영 후 재배포 필요" if node.get("redeploy") else "")
+            extra = "\n서버 환경변수: %s%s" % (node["env"], " · [Render에 반영] 이 재배포와 반영 확인까지 한다" if node.get("redeploy") else "")
         if node.get("missing"):
             extra += "\n필수 설정 없음: %s" % ", ".join(node["missing"])
         self.node_desc.configure(text=(node.get("desc", "") or "") + extra)
@@ -563,6 +584,16 @@ class App:
             self.node_value.set(str(current))
             ttk.Entry(self.value_box, textvariable=self.node_value, width=12).pack(side="left")
             ttk.Label(self.value_box, text="(%s ~ %s)" % (node.get("min"), node.get("max"))).pack(side="left", padx=6)
+        elif kind == "text":
+            self.node_value.set(str(current or ""))
+            ttk.Entry(self.value_box, textvariable=self.node_value, width=36).pack(side="left")
+            ttk.Label(self.value_box, text="예: %s" % node.get("placeholder", "")).pack(side="left", padx=6)
+        elif kind == "secret":
+            self.node_value.set("")
+            ttk.Label(self.value_box, text="값은 저장하지 않습니다 — [Render에 반영] 을 누르면 가려진 칸으로 묻습니다.").pack(side="left")
+        elif kind == "key":
+            self.node_value.set("")
+            ttk.Label(self.value_box, text="[Render에 반영] 또는 [이 노드 실행] = 공개키 발행(키 파일·패스프레이즈).").pack(side="left")
         else:
             self.node_value.set("")
             ttk.Label(self.value_box, text="값이 없는 실행 노드입니다 — [이 노드 실행] 을 누르세요.").pack(side="left")
@@ -571,7 +602,7 @@ class App:
         node = self._node_def(self.selected_node)
         if not node:
             return
-        if node.get("kind") not in ("toggle", "choice", "number"):
+        if node.get("kind") not in ("toggle", "choice", "number", "text"):
             # 값이 없는 실행 노드에서 파일을 다시 쓰고 '저장했습니다'라고 하면 사실과 다르다.
             messagebox.showinfo("opsarchive", "값이 없는 실행 노드입니다 — [이 노드 실행] 을 쓰세요.")
             return
@@ -594,18 +625,60 @@ class App:
         self._show_node_editor()
 
     def push_node_env(self) -> None:
+        """한 노드를 Render 에 반영한다 — 값 올리기 → (묻고) 재배포 → 다시 읽어 반영 확인까지."""
         node = self._node_def(self.selected_node)
         if not node or not node.get("env"):
             messagebox.showinfo("opsarchive", "이 노드는 서버 환경변수와 연결돼 있지 않습니다.")
             return
-        self.run("Render 반영(%s)" % node["env"], lambda: workflow.push_env(
-            self.selected_node, self.policy, service=self.require("service")))
+        if node.get("kind") == "key":
+            self.do_publish()                     # 공개키는 키 파일에서 역산해 발행(환경변수·재배포·지문 대조)
+            return
+        secrets = None
+        node_ids = [self.selected_node]
+        if node.get("kind") == "secret":
+            value = simpledialog.askstring("opsarchive", "%s 값을 붙여넣으세요(화면·파일·로그에 남지 않습니다)" % node["env"],
+                                           show="*", parent=self.root) or ""
+            if not value.strip():
+                return
+            secrets, node_ids = {node["env"]: value.strip()}, []
+        elif node.get("kind") == "text" and not str(self.policy.get(self.selected_node) or "").strip():
+            messagebox.showinfo("opsarchive", "값이 비어 있습니다 — 먼저 값을 넣고 [정책에 저장] 하세요.")
+            return
+        self._apply_env(node_ids, secrets, "Render 반영(%s)" % node["env"])
+
+    def apply_all_env(self) -> None:
+        """정책의 모든 환경변수 노드 중 **바뀐 것만** 올리고 한 번 재배포한 뒤 반영을 확인한다."""
+        self._apply_env(None, None, "변경 모아 반영")
+
+    def _apply_env(self, node_ids, secrets, label: str) -> None:
+        answer = messagebox.askyesnocancel(
+            "opsarchive", "바뀐 값을 Render 에 올립니다.\n\n[예] 올리고 재배포한 뒤 반영됐는지 확인(권장)\n"
+                          "[아니요] 값만 올리기(재배포 전에는 앱에 적용되지 않음)\n[취소] 그만두기", parent=self.root)
+        if answer is None:
+            return
+        service = self.require("service")
+        base_url = str(self.settings.get("base_url") or "")
+        policy = dict(self.policy)
+
+        def work() -> dict:
+            result = workflow.apply_env(policy, service=service, node_ids=node_ids, secrets=secrets,
+                                        redeploy=bool(answer), base_url=base_url)
+            if result.get("verified"):
+                result["_state"] = "반영 확인(Render 값 = 정책, 재배포 완료)" if result.get("redeployed") else "바뀐 값 없음"
+            elif not answer and not result.get("error"):
+                result["_state"] = "값만 올림 — 재배포 필요"
+            return result
+
+        self.run(label, work)
 
     def run_node(self) -> None:
         node = self._node_def(self.selected_node)
         if not node:
             return
         secrets = {}
+        if self.selected_node == "pubkey":
+            self.do_publish()
+            return
         if self.selected_node == "anchor":
             sign_file = self.pick_key("sign")
             if not sign_file:
@@ -870,10 +943,12 @@ class App:
                    "앱이 지울 수 없는 플랫폼 로그의 /account/erase 요청 수와 체인 기록을 비교합니다(누락 탐지).",
                    "observe", "observe 실행", self.do_observe)
         self._step(steps, 4, "⑤", "핀 파일",
-                   "개인키에서 역산한 지문을 저장소 파일에 기록합니다. 이후 핀 검사·CI 가 '예상 밖 키'를 잡습니다.",
+                   "개인키에서 역산한 지문을 저장소 **밖**(~/.opsarchive)에 기록합니다. "
+                   "CI 가 읽는 값은 ⑨ 에서 Actions 변수로 올립니다.",
                    "pin", "핀 만들기", self.do_pin)
-        self._step(steps, 5, "⑥", "핀 검사",
-                   "핀 파일과 배포된 /health 의 지문·세대를 대조합니다(CI cron 과 같은 검사).",
+        self._step(steps, 5, "⑥", "핀 검사(로컬)",
+                   "**로컬** 핀과 배포된 /health 의 지문·세대를 대조합니다. CI 는 같은 검사를 Actions 변수로 하므로, "
+                   "변수가 낡았는지는 ⑩ 원격 대조로 확인하세요.",
                    "pin-check", "핀 검사 실행", self.do_pin_check)
         self._step(steps, 6, "⑦", "IAM 검사",
                    "앱 서비스 계정이 증거를 지울 수 있는지 시험합니다(목표: 만들 수는 있고 지울 수는 없다).",
@@ -882,6 +957,14 @@ class App:
                    "워크플로우 env 노드를 [Render에 반영] 한 뒤 이 버튼으로 재배포합니다(환경변수는 재배포해야 실제로 적용됩니다). "
                    "환경변수 반영 뒤 이 버튼으로 재배포한다 — 재배포가 끝나면 ② doctor 로 지문을 다시 대조하세요.",
                    "redeploy", "재배포 실행", self.do_redeploy)
+        self._step(steps, 8, "⑨", "핀을 Actions 변수로",
+                   "핀의 공개값을 GitHub Actions 변수(vars.EVIDENCE_PIN_*)로 올립니다. "
+                   "**키를 회전했으면 여기서 반드시 갱신하세요** — 그러지 않으면 CI 가 빨강이 됩니다.",
+                   "pin-publish", "변수로 올리기", self.do_pin_publish)
+        self._step(steps, 9, "⑩", "원격 변수 대조",
+                   "원격 Actions 변수와 로컬 핀이 같은지 봅니다(다르면 ⑨ 로 올리세요). "
+                   "로컬 ⑥ 은 초록인데 CI 는 빨강인 상태를 이 검사가 잡아냅니다.",
+                   "pin-remote", "원격 대조 실행", self.do_pin_remote_check)
         self.render_hint = self._hint(frame)
 
     def check_remote_status(self) -> None:
@@ -1142,9 +1225,15 @@ class App:
         phrase = self.ask_key_pass(key_file, "개인키 패스프레이즈")
         if not key_file or not phrase:
             return
-        self.run("publish", lambda: commands.publish(
-            self.require("service"), key_file, phrase, env_key=self.settings.get("env_key"),
-            base_url=self.settings.get("base_url"), on_step=self.log))
+        def work() -> dict:
+            result = commands.publish(
+                self.require("service"), key_file, phrase, env_key=self.settings.get("env_key"),
+                base_url=self.settings.get("base_url"), on_step=self.log)
+            # 회전·재발행 뒤 CI 가 읽는 값(Actions 변수)은 자동으로 바뀌지 않는다 — 다음 행동을 알려준다.
+            self.log("※ 개인키를 바꿨습니다 — CI 가 읽는 값은 Render 탭 ⑨ [변수로 올리기] 로 갱신하고, "
+                     "⑩ [원격 대조] 로 확인하세요.")
+            return result
+        self.run("publish", work)
 
     def do_doctor(self) -> None:
         key_file = self.pick_key("admin")
@@ -1185,11 +1274,28 @@ class App:
             return
         self.run("pin", lambda: commands.make_pin(
             key_file, phrase, health_url=self.require("base_url"), out=self.settings.get("pin_path"),
-            generation=int(self.settings.get("generation") or 1), signing_public=signing))
+            generation=None, signing_public=signing))
 
     def do_pin_check(self) -> None:
         self.run("pin-check", lambda: commands.check_pin(self.settings.get("pin_path"),
                                                          health_url=self.require("base_url")))
+
+    def _gh_repo(self) -> str:
+        """Actions 변수를 올릴/대조할 저장소(환경변수 EVIDENCE_GH_REPO → 설정 → 기본 팀 저장소)."""
+        return (self.settings.get("gh_repo") or os.environ.get("EVIDENCE_GH_REPO")
+                or "01044402345o-beep/codyssey_final")
+
+    def do_pin_publish(self) -> None:
+        """핀의 공개값을 GitHub Actions 변수로 올린다(저장소 파일로는 올리지 않는다)."""
+        repo = self._gh_repo()
+        self.run("핀 변수 올리기", lambda: commands.pin_publish(
+            self.settings.get("pin_path") or "", repo=repo))
+
+    def do_pin_remote_check(self) -> None:
+        """원격 Actions 변수와 로컬 핀의 드리프트를 본다(회전 뒤 갱신을 잊었는지)."""
+        repo = self._gh_repo()
+        self.run("원격 변수 대조", lambda: commands.pin_remote_check(
+            self.settings.get("pin_path") or "", repo=repo))
 
     def do_iam(self) -> None:
         self.run("iam-check", lambda: commands.iam_check(self.require("project_id"),
@@ -1216,6 +1322,366 @@ class App:
             return result
 
         self.run("재배포", work)
+
+    # ------------------------------------------------------------ 탭: Firestore 규칙
+    def _tab_rules(self, notebook) -> None:
+        frame = self._frame(notebook, "Firestore 규칙")
+        ttk.Label(frame, text="앱 계정 기록(users/{uid})의 보안 규칙입니다. 저장소의 firestore.rules 를 (default) 데이터베이스에 "
+                              "배포하고, 배포된 규칙을 다시 읽어 같은지 확인합니다.",
+                  wraplength=840).pack(anchor="w", padx=10, pady=(8, 0))
+        self.rules_info = tk.StringVar(value=self._rules_info_text())
+        info = ttk.Label(frame, textvariable=self.rules_info, justify="left", foreground="#444")
+        info.pack(anchor="w", padx=10, pady=(6, 0), fill="x")
+        self._wrap(info, frame)
+        steps = self._steps_frame(frame)
+        self._step(steps, 0, "①", "배포된 규칙과 대조",
+                   "지금 배포된 규칙을 읽어(읽기 전용) 저장소 파일과 비교합니다. 다르면 차이를 로그에 보여 줍니다 — "
+                   "누군가 콘솔에서 규칙을 고쳤거나, 저장소를 고치고 아직 배포하지 않은 상태입니다.",
+                   "rules-status", "대조 실행", self.do_rules_status)
+        self._step(steps, 1, "②", "문법 검사(dry-run)",
+                   "배포하지 않고 규칙 파일을 컴파일만 해 봅니다.",
+                   "rules-dry", "검사 실행", self.do_rules_dry)
+        self._step(steps, 2, "③", "규칙 배포",
+                   "확인 창에서 프로젝트를 한 번 더 확인한 뒤 배포합니다(되돌릴 수 없음 — 콘솔에서 고친 규칙은 덮어씁니다). "
+                   "배포가 끝나면 ① 대조를 자동으로 돌려 반영됐는지 확인합니다.",
+                   "rules-deploy", "규칙 배포", self.do_rules_deploy)
+
+    def _rules_info_text(self) -> str:
+        project = str(self.settings.get("project_id") or "(설정 탭에서 Firebase 프로젝트 ID 를 넣으세요)")
+        rc = commands.firebaserc_default()
+        try:
+            target = firebase.rules_target(config.repo_root())
+            where = target["rules_file"]
+        except firebase.FirebaseError as exc:
+            where = "규칙 파일을 찾지 못했습니다(%s)" % exc.code
+        warn = ""
+        if rc and self.settings.get("project_id") and rc != self.settings.get("project_id"):
+            warn = "\n⚠ 설정의 프로젝트(%s)가 저장소 .firebaserc 기본값(%s)과 다릅니다 — 맞는 프로젝트인지 확인하세요." % (
+                self.settings.get("project_id"), rc)
+        return "대상 프로젝트: %s · 데이터베이스: (default)\n규칙 파일: %s%s" % (project, where, warn)
+
+    def _log_rules(self, result: dict) -> None:
+        for line in result.get("diff") or []:
+            self.log("   " + line, "err" if line.startswith("-") else ("ok" if line.startswith("+") else "info"))
+        if result.get("detail"):
+            self.log("   firebase CLI: " + str(result["detail"]), "err")
+
+    def do_rules_status(self) -> None:
+        def work() -> dict:
+            result = commands.rules_status(self.require("project_id"), self.require("sa_path"))
+            self._log_rules(result)
+            out = {k: v for k, v in result.items() if k != "diff"}
+            if result["match"] is None:
+                out["error"] = "배포본을 읽지 못함: " + result["reason"]
+            elif not result["match"]:
+                # 드리프트는 '완료'가 아니다 — 콘솔에서 바뀌었거나 저장소를 고치고 아직 배포하지 않았다.
+                out["error"] = "rules_differ"
+                out["_state"] = "배포본이 저장소와 다름(콘솔 수정 또는 미배포) — 로그의 차이 확인"
+            else:
+                out["_state"] = "일치(배포본 = 저장소)"
+            return out
+
+        self.run("규칙 대조", work)
+
+    def do_rules_dry(self) -> None:
+        def work() -> dict:
+            result = commands.rules_deploy(self.require("project_id"), dry_run=True)
+            self._log_rules(result)
+            return result
+
+        self.run("규칙 검사", work)
+
+    def do_rules_deploy(self) -> None:
+        project = self.require_ui("project_id")
+        if not project:
+            return
+        try:
+            local = firebase.local_rules(config.repo_root())
+        except firebase.FirebaseError as exc:
+            messagebox.showerror("opsarchive", "규칙 파일을 찾지 못했습니다: %s" % exc.code)
+            return
+        rc = commands.firebaserc_default()
+        warn = ("\n\n⚠ 저장소 .firebaserc 기본값은 %s 입니다. 다른 프로젝트에 배포하려는 게 맞나요?" % rc) if rc and rc != project else ""
+        if not messagebox.askyesno(
+                "Firestore 규칙 배포",
+                "프로젝트: %s\n데이터베이스: (default)\n파일: %s\nsha256: %s…\n\n"
+                "배포하면 지금 규칙을 덮어씁니다(콘솔에서 고친 내용 포함). 되돌리려면 이전 파일로 다시 배포해야 합니다.%s\n\n배포할까요?"
+                % (project, local["rules_file"], local["sha256"][:16], warn), icon="warning", parent=self.root):
+            self.log("규칙 배포를 취소했습니다.")
+            return
+        sa = str(self.settings.get("sa_path") or "")
+
+        def work() -> dict:
+            result = commands.rules_deploy(project, sa)
+            self._log_rules(result)
+            out = {k: v for k, v in result.items() if k != "diff"}
+            verified = result.get("verified")
+            if result.get("error") == "deployed_rules_differ":
+                out["_state"] = "배포했지만 배포본이 저장소와 다름 — 로그의 차이 확인"
+            elif result.get("error") == "cli_timeout":
+                out["_state"] = "시간 초과 — 배포됐을 수 있음, ① 대조로 확인"
+            elif result.get("error"):
+                out["_state"] = "배포 안 됨: " + str(result["error"])
+            elif verified:
+                out["_state"] = "반영 확인(배포본 = 저장소) · 적용까지 최대 1~10분"
+            else:
+                out["_state"] = "배포됨 · 반영은 확인 못 함(%s) — ① 대조로 확인" % (result.get("verify_reason") or "확인 불가")
+            return out
+
+        self.run("규칙 배포", work)
+
+    def require_ui(self, key: str) -> str:
+        value = str(self.settings.get(key) or "").strip()
+        if not value:
+            messagebox.showerror("opsarchive", "설정 탭에서 '%s' 를 먼저 넣으세요." % key)
+        return value
+
+    # ------------------------------------------------------------ 탭: 사용자 데이터
+    def _tab_users(self, notebook) -> None:
+        frame = self._frame(notebook, "사용자 데이터")
+        ttk.Label(frame, text="계정별 기록(users/{uid})을 찾아보고 관리합니다. 개인정보입니다 — 사용자의 요청(열람·삭제)이나 장애 대응 때만 여세요.\n"
+                              "상세 보기·통역 기록 내용·내보내기·삭제는 사유를 받아 이 PC의 열람 기록(~/.opsarchive/access-log.jsonl)에 남깁니다. "
+                              "계정 삭제(탈퇴)는 여기서 하지 않습니다 — 앱의 탈퇴 흐름을 쓰세요.",
+                  wraplength=840, foreground="#a60", justify="left").pack(anchor="w", padx=10, pady=(8, 4))
+        bar = ttk.Frame(frame)
+        bar.pack(fill="x", padx=10, pady=4)
+        ttk.Label(bar, text="uid 또는 이메일").pack(side="left")
+        self.user_query = tk.StringVar(value="")
+        entry = ttk.Entry(bar, textvariable=self.user_query, width=42)
+        entry.pack(side="left", padx=6)
+        entry.bind("<Return>", lambda _e: self.do_user_find())
+        ttk.Button(bar, text="찾기", command=self.do_user_find).pack(side="left", padx=2)
+        ttk.Button(bar, text="목록 새로 고침", command=self.do_user_list).pack(side="left", padx=2)
+        self.user_count = tk.StringVar(value="")
+        ttk.Label(bar, textvariable=self.user_count, foreground="#06c").pack(side="left", padx=10)
+
+        columns = ("uid", "updated", "days", "weak", "trip", "ilog", "consent")
+        titles = {"uid": "uid", "updated": "최근 변경", "days": "학습일", "weak": "복습",
+                  "trip": "여행", "ilog": "통역 기록", "consent": "통역 저장 동의"}
+        self.user_tree = ttk.Treeview(frame, columns=columns, show="headings", height=8)
+        for name in columns:
+            self.user_tree.heading(name, text=titles[name])
+            self.user_tree.column(name, width=230 if name == "uid" else 95, anchor="w")
+        self.user_tree.pack(fill="both", expand=True, padx=10, pady=4)
+        self.user_tree.bind("<<TreeviewSelect>>", self._on_pick_user)
+
+        acts = ttk.Frame(frame)
+        acts.pack(fill="x", padx=10, pady=2)
+        self.user_pick = tk.StringVar(value="")
+        ttk.Label(acts, text="선택:").pack(side="left")
+        ttk.Label(acts, textvariable=self.user_pick, width=34).pack(side="left", padx=4)
+        for text, cmd in (("상세 보기", self.do_user_detail), ("통역 기록 내용", self.do_user_ilog),
+                          ("JSON 내보내기", self.do_user_export), ("통역 기록 삭제", self.do_user_delete_ilog),
+                          ("열람 기록", self.do_user_audit)):
+            ttk.Button(acts, text=text, command=cmd).pack(side="left", padx=2)
+
+        self.user_text = tk.Text(frame, height=12, wrap="word", state="disabled")
+        self.user_text.pack(fill="both", expand=True, padx=10, pady=(4, 8))
+        self.user_rows: list = []
+        self.user_detail_text = ""
+
+    def _on_pick_user(self, _event=None) -> None:
+        selection = self.user_tree.selection()
+        if selection:
+            values = self.user_tree.item(selection[0], "values")
+            if values:
+                self.user_pick.set(values[0])
+
+    def _fill_users(self) -> None:
+        """사용자 표·상세 칸을 다시 채운다(메인 스레드에서만 — Tk 규칙)."""
+        if not hasattr(self, "user_tree"):
+            return
+        for item in self.user_tree.get_children():
+            self.user_tree.delete(item)
+        for r in self.user_rows:
+            self.user_tree.insert("", "end", values=(
+                r["uid"], r["updated"], r["study_days"], r["weak"], "있음" if r["trip"] else "—",
+                ("%d대화·%d문장" % (r["ilog_sessions"], r["ilog_lines"])) if r["ilog_sessions"] else "—",
+                "동의" if r["ilog_consent"] else "—"))
+        self.user_count.set("%d명" % len(self.user_rows) if self.user_rows else "")
+        self.user_text.configure(state="normal")
+        self.user_text.delete("1.0", "end")
+        self.user_text.insert("end", self.user_detail_text)
+        self.user_text.configure(state="disabled")
+
+    def _users(self) -> "users.Users":
+        return users.Users(self.require("project_id"), self.require("sa_path"))
+
+    def _picked_uid(self) -> str:
+        uid = (self.user_pick.get() or "").strip()
+        if not uid:
+            messagebox.showinfo("opsarchive", "표에서 사용자를 고르거나 위에서 찾으세요.")
+        return uid
+
+    def _ask_reason(self, what: str) -> str:
+        reason = simpledialog.askstring("사유 입력", "%s 사유를 적어 주세요(열람 기록에 남습니다).\n예: 사용자 열람 요청 10/22, 장애 #123" % what,
+                                        parent=self.root) or ""
+        if len(" ".join(reason.split())) < 2:
+            if reason:
+                messagebox.showinfo("opsarchive", "사유를 두 글자 이상 적어 주세요.")
+            return ""
+        return reason
+
+    def _show_user_text(self, text: str) -> None:
+        self.user_detail_text = text
+        self.log_queue.put(("users", ""))
+
+    def do_user_list(self) -> None:
+        def work() -> dict:
+            rows = self._users().list_users()
+            self.user_rows = rows
+            self._show_user_text("목록에는 요약만 나옵니다. 줄을 고르고 [상세 보기] 를 누르세요.")
+            return {"사용자": "%d명" % len(rows)}
+
+        self.run("사용자 목록", work)
+
+    def do_user_find(self) -> None:
+        query = (self.user_query.get() or "").strip()
+        if not query:
+            return
+
+        def work() -> dict:
+            uid = users.find_uid(self.require("project_id"), self.require("sa_path"), query)
+            store = self._users()
+            doc = store.get(uid)
+            self.user_rows = [users.summarize(uid, doc)] if doc else []
+            self.user_pick_value = uid
+            self._show_user_text(("찾음: %s — [상세 보기] 로 자세히 봅니다." % uid) if doc else
+                                 "uid %s 의 계정 기록 문서가 없습니다(로그인 기록이 없거나 탈퇴)." % uid)
+            return {"uid": uid, "문서": "있음" if doc else "없음"}
+
+        self.run("사용자 찾기", work)
+        self.root.after(300, self._apply_found_pick)
+
+    def _apply_found_pick(self) -> None:
+        if self.busy:
+            self.root.after(300, self._apply_found_pick)
+            return
+        uid = getattr(self, "user_pick_value", "")
+        if uid:
+            self.user_pick.set(uid)
+            self.user_pick_value = ""
+
+    def do_user_detail(self) -> None:
+        uid = self._picked_uid()
+        reason = uid and self._ask_reason("상세 보기")
+        if not reason:
+            return
+
+        def work() -> dict:
+            auth: object = None
+            try:
+                auth = users.auth_lookup(self.require("project_id"), self.require("sa_path"), uid=uid)
+            except (users.UserError, gcp.GcpError) as exc:
+                auth = "조회 못 함(%s) — 서비스 계정에 Firebase Authentication 조회 권한이 필요합니다" % exc.code
+            info = users.detail(self._users(), uid, reason, auth=auth)
+            self._show_user_text(self._format_detail(info))
+            return {"uid": uid, "문서": "있음" if info["document"] else "없음", "탈퇴 흔적": info["tombstone"]}
+
+        self.run("사용자 상세", work)
+
+    @staticmethod
+    def _format_detail(info: dict) -> str:
+        auth = info.get("auth")
+        lines = ["uid: %s" % info["uid"]]
+        if isinstance(auth, dict):
+            lines.append("계정: %s · %s · 로그인 방식 %s · 가입 %s · 최근 로그인 %s%s" % (
+                auth["email"] or "(이메일 없음)", auth["name"] or "(이름 없음)", ",".join(p for p in auth["providers"] if p) or "-",
+                auth["created"], auth["last_login"], " · 사용 중지됨" if auth["disabled"] else ""))
+        elif auth is None:
+            lines.append("계정: Authentication 에 없음(탈퇴했거나 삭제됨)")
+        else:
+            lines.append("계정: " + str(auth))
+        lines.append("탈퇴 흔적(deleted/uid): %s" % ("있음 — 앱이 이 계정의 읽기·쓰기를 거부합니다" if info["tombstone"] else "없음"))
+        if not info["document"]:
+            lines.append("계정 기록 문서: 없음")
+            return "\n".join(lines)
+        s = info["summary"]
+        lines.append("문서: 만든 시각 %s · 최근 변경 %s · %d바이트%s" % (s["created"], s["updated"], s["bytes"],
+                                                            (" · 깨진 필드 " + ",".join(s["broken"])) if s["broken"] else ""))
+        p = info["progress"]
+        lines.append("학습: %d일(%s ~ %s) · 마지막 화면 %s" % (p["study_days"], p["first"] or "-", p["last"] or "-", p["screen"] or "-"))
+        lines.append("복습 목록 %d개: %s" % (s["weak"], ", ".join(x for x in p["weak"] if x) or "-"))
+        c = info["consent"]
+        lines.append("말하기 동의: %s (버전 %s, %s)" % ("예" if c["voice"] else "아니요", c["version"], c["at"] or "-"))
+        t = info["trip"]
+        lines.append("여행: " + ("%s · %s · 학습 시작 %s" % (t["country"], " / ".join(t["cities"]), t["study_start"]) if t else "없음"))
+        il = info["ilog"]
+        if il:
+            lines.append("통역 기록: 동의 %s(버전 %s) · %d대화" % (il["consent_at"], il["consent_version"], len(il["sessions"])))
+            for x in il["sessions"][:30]:
+                lines.append("   · %s · %s · %d문장" % (x["at"], x["route"] or "여행 없이", x["lines"]))
+            lines.append("   (문장 본문은 [통역 기록 내용] 으로 따로 봅니다 — 상대방 말이 들어 있습니다)")
+        else:
+            lines.append("통역 기록: 없음(계정 저장에 동의하지 않았거나 지웠음)")
+        return "\n".join(lines)
+
+    def do_user_ilog(self) -> None:
+        uid = self._picked_uid()
+        reason = uid and self._ask_reason("통역 기록 내용 보기(상대방 말 포함)")
+        if not reason:
+            return
+
+        def work() -> dict:
+            text = users.ilog_text(self._users(), uid, reason)
+            self._show_user_text(text)
+            return {"uid": uid}
+
+        self.run("통역 기록 내용", work)
+
+    def do_user_export(self) -> None:
+        uid = self._picked_uid()
+        reason = uid and self._ask_reason("내보내기(열람 요구 대응)")
+        if not reason:
+            return
+        out = filedialog.asksaveasfilename(parent=self.root, defaultextension=".json",
+                                           initialfile="user-%s.json" % users.uid_hash(uid)[:8],
+                                           filetypes=[("JSON", "*.json")])
+        if not out:
+            return
+
+        def work() -> dict:
+            auth = None
+            try:
+                auth = users.auth_lookup(self.require("project_id"), self.require("sa_path"), uid=uid)
+            except (users.UserError, gcp.GcpError):
+                auth = None
+            result = users.export(self._users(), uid, reason, out, auth=auth)
+            self._show_user_text("내보냈습니다: %s\n개인정보가 든 파일입니다 — 전달한 뒤 지우세요." % out)
+            return result
+
+        self.run("사용자 내보내기", work)
+
+    def do_user_delete_ilog(self) -> None:
+        uid = self._picked_uid()
+        if not uid:
+            return
+        typed = simpledialog.askstring(
+            "통역 기록 삭제",
+            "이 사용자의 서버 통역 기록(ilog)을 지웁니다. 되돌릴 수 없습니다. 진도·여행은 그대로입니다.\n"
+            "계속하려면 uid 를 그대로 입력하세요:\n%s" % uid, parent=self.root) or ""
+        if typed.strip() != uid:
+            if typed:
+                messagebox.showinfo("opsarchive", "uid 가 달라 취소했습니다.")
+            return
+        reason = self._ask_reason("통역 기록 삭제")
+        if not reason:
+            return
+
+        def work() -> dict:
+            result = users.delete_ilog(self._users(), uid, reason)
+            self._show_user_text(("삭제했습니다. " if result["deleted"] else "") + result["note"])
+            return result
+
+        self.run("통역 기록 삭제", work)
+
+    def do_user_audit(self) -> None:
+        rows = users.read_audit(50)
+        text = "\n".join("%s  %-20s uid#%s  %s  [%s] %s" % (r.get("at", ""), r.get("action", ""), r.get("uid_hash", ""),
+                                                          r.get("admin", ""), r.get("result", ""), r.get("reason", ""))
+                         for r in reversed(rows))
+        self.user_detail_text = "열람 기록(최근 50건, %s)\n" % users.audit_path() + (text or "(아직 없음)")
+        self._fill_users()
 
     # ------------------------------------------------------------ 탭 5: 보관소
     def _tab_store(self, notebook) -> None:
@@ -1336,6 +1802,19 @@ class App:
         self._step(steps, 3, "④", "챌린지 대조(사용자 증명)",
                    "사용자가 보낸 챌린지가 앵커 범위 안에 있는지 봅니다 — 없으면 **누락 의심**입니다.",
                    "challenge", "챌린지로 검증", self.do_verify_challenge)
+        self._step(steps, 4, "⑤", "KMS 서명 키 점검·핀에 넣기",
+                   "설정의 KMS 키(Ed25519)로 시험 서명을 해 보고, 그 공개키를 핀의 **자동 서명 키**로 넣습니다. "
+                   "넣은 뒤 Render 탭 ⑨ 로 Actions 변수를 다시 올려야 자동 앵커(CI)가 검증할 수 있습니다.",
+                   "kms", "KMS 점검·핀 추가", self.do_kms_pin_add)
+        self._step(steps, 5, "⑥", "자동 앵커 검증(Firestore)",
+                   "자동 앵커(CI)가 Firestore 에 쌓은 체크포인트와 로컬 체크포인트를 함께 검증하고, "
+                   "마지막 체크포인트가 13시간보다 오래됐으면(자동 앵커가 멈춤) 실패로 알립니다.",
+                   "verify-auto", "자동 앵커 검증", self.do_verify_auto)
+        self._step(steps, 6, "⑦", "KMS 서명 감사 대조(누가 서명했나)",
+                   "Cloud 감사 로그의 KMS 서명 기록(누가·언제)을 체크포인트와 맞춰 봅니다. 짝이 없는 서명은 **무단 서명 의심**, "
+                   "실패한 요청은 **누가 시도했는지** 보여 줍니다. KMS 데이터 액세스 로그가 켜져 있어야 하고, "
+                   "서비스 계정에 roles/logging.privateLogViewer 가 필요합니다.",
+                   "kms-audit", "감사 대조(7일)", self.do_kms_audit)
         self.verify_hint = self._hint(frame)
 
     def do_verify_status(self) -> None:
@@ -1360,7 +1839,7 @@ class App:
             out["앵커 목록 파일"] = "있음" if os.path.isdir(os.path.join(directory, "anchors")) else "없음"
             try:
                 entries = gcp.Firestore(self.require("project_id"), self.require("sa_path")).list(
-                    "evidence_chain/entries", page_size=300)
+                    "evidence_entries", page_size=300)
                 out["체인 시도·결과 항목"] = "%d개" % len(entries)
             except Exception as exc:      # noqa: BLE001
                 out["체인 항목"] = "확인 실패(%s)" % getattr(exc, "code", type(exc).__name__)
@@ -1381,6 +1860,31 @@ class App:
         self.run("verify-chain", lambda: commands.verify_chain(
             self.require("project_id"), self.require("sa_path"), self.settings.get("pin_path"),
             out_dir=self.settings.get("checkpoints_dir"), challenge=challenge))
+
+    def do_kms_pin_add(self) -> None:
+        kms_key = str(self.settings.get("kms_key") or "").strip()
+        if not kms_key:
+            messagebox.showerror("opsarchive", "설정 탭에서 'KMS 서명 키' 를 먼저 넣으세요.")
+            return
+        if not messagebox.askyesno("opsarchive", "KMS 키로 시험 서명을 하고, 그 공개키를 핀의 자동 서명 키로 넣습니다.\n\n%s\n\n계속할까요?" % kms_key,
+                                   parent=self.root):
+            return
+        self.run("KMS 핀 추가", lambda: commands.kms_pin_add(
+            self.settings.get("pin_path") or "", kms_key, self.require("sa_path")))
+
+    def do_verify_auto(self) -> None:
+        self.run("자동 앵커 검증", lambda: commands.verify_chain(
+            self.require("project_id"), self.require("sa_path"), self.settings.get("pin_path"),
+            out_dir=self.settings.get("checkpoints_dir"), source="both", max_age_hours=13))
+
+    def do_kms_audit(self) -> None:
+        kms_key = str(self.settings.get("kms_key") or "").strip()
+        if not kms_key:
+            messagebox.showerror("opsarchive", "설정 탭에서 'KMS 서명 키' 를 먼저 넣으세요.")
+            return
+        self.run("KMS 감사 대조", lambda: commands.kms_audit_check(
+            self.require("project_id"), self.require("sa_path"), kms_key, days=7,
+            pin_path=self.settings.get("pin_path") or "", out_dir=self.settings.get("checkpoints_dir") or ""))
 
     def do_verify_challenge(self) -> None:
         value = simpledialog.askstring("opsarchive", "사용자가 제시한 챌린지(16진수)", parent=self.root) or ""

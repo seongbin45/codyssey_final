@@ -253,6 +253,35 @@ class T(unittest.TestCase):
         self.assertEqual(bad.status_code, 400)
         self.assertEqual(bad.json()["detail"], "invalid_state")
 
+    def test_pre_study_dates_round_trip_and_are_validated(self):
+        # 미리 학습한 날짜(pre)는 선택 항목이다 — 그날이 오면 화면이 완료로 옮긴다.
+        session = {**SESSION, "pre": {"2026-09-25": 1_700_000_000_200}}
+        saved = self.put(claims_for("uid-1"), {**BODY, "session": session})
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(self.get(claims_for("uid-1")).json()["session"]["pre"], {"2026-09-25": 1_700_000_000_200})
+        state = user_state.parse_state({**BODY, "session": session})
+        self.assertEqual(user_state.decode_document(user_state.encode_document(state)), state)
+        self.assertNotIn("pre", user_state.parse_state(BODY)["session"])   # 없는 옛 본문은 그대로
+        for bad in ({"10/01": 1}, {"2026-09-25": "x"}, ["2026-09-25"]):
+            res = self.put(claims_for("uid-1"), {**BODY, "session": {**SESSION, "pre": bad}})
+            self.assertEqual(res.status_code, 400, bad)
+
+    def test_activity_counts_round_trip_and_are_validated(self):
+        # 날짜별 학습 활동 수(act)는 선택 항목이다 — 연속 학습·오늘 목표가 다른 기기에서도 이어진다.
+        session = {**SESSION, "act": {"2026-10-19": 12, "2026-10-20": 3}}
+        saved = self.put(claims_for("uid-1"), {**BODY, "session": session})
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(self.get(claims_for("uid-1")).json()["session"]["act"], {"2026-10-19": 12, "2026-10-20": 3})
+        state = user_state.parse_state({**BODY, "session": session})
+        self.assertEqual(user_state.decode_document(user_state.encode_document(state)), state)
+        self.assertNotIn("act", user_state.parse_state(BODY)["session"])   # 없는 옛 본문은 그대로
+        too_many = {f"2025-{m:02d}-{d:02d}": 1 for m in range(1, 13) for d in range(1, 29)}   # 336일
+        too_many.update({f"2024-{m:02d}-{d:02d}": 1 for m in range(1, 4) for d in range(1, 29)})  # +84 → 420 > 400
+        for bad in ({"10/20": 1}, {"2026-10-20": "3"}, {"2026-10-20": -1}, {"2026-10-20": 10001}, {"2026-10-20": True},
+                    {"2026-10-20": 1.5}, ["2026-10-20"], too_many):
+            res = self.put(claims_for("uid-1"), {**BODY, "session": {**SESSION, "act": bad}})
+            self.assertEqual(res.status_code, 400, str(bad)[:60])
+
     def test_state_without_trip_reads_as_empty(self):
         # trip 은 나중에 붙은 항목이라 예전 본문(키 없음)도 받아들인다.
         self.assertEqual(user_state.parse_state(BODY)["trip"], None)
@@ -282,6 +311,7 @@ class T(unittest.TestCase):
         self.assertIsNotNone(found, "firestore.rules 에서 hasOnly 목록을 찾지 못했습니다")
         allowed = [k.strip().strip("'\"") for k in found.group(1).split(",") if k.strip()]
         doc = user_state.encode_document(user_state.parse_state({**BODY, "trip": TRIP}))
+        doc["fields"]["ilog"] = {"stringValue": "{}"}   # 통역 기록은 따로 쓰는 필드다(write_ilog)
         self.assertEqual(set(doc["fields"]), set(allowed), "쓰는 필드와 보안 규칙 허용 목록이 다릅니다")
         # 규칙은 각 필드가 문자열(JSON)이기를 요구한다 — 인코딩도 그렇게 해야 한다.
         for name in allowed:

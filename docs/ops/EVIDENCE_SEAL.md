@@ -189,7 +189,7 @@ scrypt(n=2^15, r=8, p=1) 로 패스프레이즈 유도. 파일 권한 0600.
 - **(b) 매니페스트 서명 + (d) 해시체인·앱 밖 앵커**: 관리자 오프라인 Ed25519 키로 `{count, head, prev_head}` 체크포인트를 서명하고 저장소 밖(로컬·서명 태그·투명성 로그)에 앵커. 누락 대조는 `verify` 가 한다.
 - **(f) 클라이언트 서명 영수증**: 탈퇴 응답에 JWS 영수증을 주고 화면이 "영수증 없으면 상태 불명"을 보이게 한다(nonce 로 재사용 방지, uid 는 솔트 해시만).
 - **(g) 감시·canary**: heartbeat, 쿼터 알림, canary 계정 주기 삭제.
-- **(c) Cloud KMS**: 카드/Blaze 수용 시에만. **키 비유출**을 더하지만 **app-control 위조는 여전히 못 막는다**.
+- **(c) Cloud KMS** — **구현됨(2026-10-22, 동결 해제)**: 자동 앵커의 서명 키를 KMS(Ed25519)에 둔다. 키 비유출을 더하지만 **app-control 위조는 여전히 못 막는다**. 봉투(복호화) 키는 옮기지 않았다(KMS 는 X25519 복호화를 지원하지 않음). 설정: [`KMS_AUTO_ANCHOR.md`](KMS_AUTO_ANCHOR.md)
 
 ### 이 두 겹의 한계 (같은 문서에 남긴다)
 - 핀 파일은 **저장소+CI를 함께 장악한 공격자가 바꿀 수 있다** → 신뢰 뿌리를 저장소 밖으로 옮기는 것이 (d)의 목적이다.
@@ -217,8 +217,8 @@ scrypt(n=2^15, r=8, p=1) 로 패스프레이즈 유도. 파일 권한 0600.
 - **사전 커밋먼트는 1차 구현됨(§11)**: 요청 전에 만들어 기기에 저장한 클라이언트 챌린지가 있어 **사용자가 제시하면 누락이 드러난다**. 다만 사용자가 제시하지 않으면 여전히 보이지 않고, 앱이 처음부터 체인을 만들지 않은 경우는 TSA 없이는 구분되지 않는다. 체크포인트는 "관리자가 본 시점 이후"만 되돌릴 수 없게 한다.
 - **앵커 주기가 곧 사각지대**다. 관리자가 자주 서명하지 않으면 그 사이 구간은 증명되지 않는다.
 - 체크포인트 파일은 **저장소 안**에 둘 수 있으나, 저장소와 CI 를 함께 장악한 공격자는 그것도 다시 쓴다 → 신뢰 뿌리는 **관리자 로컬 서명 키**다(저장소 체크포인트는 편의·감사용).
-- 아직 **자동 앵커(cron 워크플로)와 heartbeat 는 없다** — 지금은 관리자가 `anchor`/`verify-chain` 을 직접 돌린다.
-- 앵커는 서명 검증에 **읽기 권한**(서비스 계정)이 필요하다. CI 에서 돌리려면 앱과 **다른 읽기 전용 자격증명**을 써야 한다(앱 SA 재사용 금지).
+- **자동 앵커(cron) — 구현됨(2026-10-22, 동결 해제)**: `.github/workflows/evidence-anchor.yml` 이 6시간마다 검증 → KMS 서명 체크포인트를 Firestore `evidence_checkpoints` 에 **만들기만** 한다(WIF 단기 토큰, 키 파일 없음). 실패·13시간 초과(멈춤)는 이슈로 알린다. 저장소 변수 `EVIDENCE_AUTO_ANCHOR=on` 전에는 돌지 않는다. 자동 키 체크포인트는 관리자 로컬 키보다 낮은 근거다 — [`KMS_AUTO_ANCHOR.md`](KMS_AUTO_ANCHOR.md) §9
+- 앵커는 서명 검증에 **읽기 권한**(서비스 계정)이 필요하다. CI 는 앱과 **다른 전용 계정**(`evidence-anchor`: 읽기 + 체크포인트 만들기만, 수정·삭제 없음)을 WIF 로 쓴다(앱 SA 재사용 금지).
 
 
 
@@ -231,3 +231,23 @@ scrypt(n=2^15, r=8, p=1) 로 패스프레이즈 유도. 파일 권한 0600.
 - **Windows 파일 권한**: `os.open(0o600)` 은 Windows 에서 ACL 을 바꾸지 않는다(실측 0o666) → `icacls` 로 상속을 끊고 소유자만 남긴다. 실패하면 결과에 `permissions: inherited_warning` 이 찍힌다(조용히 넘어가지 않는다).
 - **플랫폼 제약 3가지의 출처**: Render CLI 의 env 변경 불가·GitHub 이슈 첨부 API 부재·Firebase Storage 의 Blaze 요구는 **공식 문서로 확인**했으나 **저장소 안에는 근거 문서가 없다**(이 문서가 유일한 기록이다).
 - **압축 폭탄·KDF 파라미터**: 컨테이너 수준 상한(평문 32MB)과 scrypt 파라미터 검사(2¹⁴≤n≤2²⁰)를 넣었지만, 이는 CLI 가 여는 **신뢰할 수 없는 파일**을 전제로 한 방어다. 서비스 계정이 탈취되면 그 전에 다른 경로로 피해가 난다.
+
+## 13. 핀(기대 지문)의 저장 위치 — Actions 변수 (2026-10-17 결정)
+
+공개키·지문이라도 **공개 저장소 파일로는 두지 않는다.** 핀은 검증자(CI) 쪽 자산이므로 저장소 밖에 두고,
+CI 는 **GitHub Actions 변수**를 읽는다.
+
+| 무엇 | 어디 | 누가 바꿀 수 있나 |
+|---|---|---|
+| 기대 지문·세대·키 id·서명 지문·핀 sha256 | GitHub **Actions 변수** EVIDENCE_PIN_* (저장소 Settings → Variables) | 저장소 **admin** |
+| 로컬 핀 파일(원본) | ~/.opsarchive/evidence-key-pin.json (저장소 밖) | 관리자 본인 |
+| 앱이 쓰는 봉인 공개키 | Render 환경변수 EVIDENCE_PUBKEY | Render 계정 |
+
+- 올리기: python -m opsarchive pin-publish --repo <owner/name> (값을 보고만 하려면 --dry-run)
+- 대조: python -m opsarchive pin-remote-check --repo <owner/name> — 불일치면 exit 1
+- CI: .github/workflows/verify-key-pin.yml 이 ars.EVIDENCE_PIN_FINGERPRINT·EVIDENCE_PIN_GENERATION·
+  EVIDENCE_PIN_HEALTH_URL 을 읽어 /health 와 대조한다. **변수가 비어 있으면 실패(fail-closed)** 한다 —
+  "설정을 안 했다"가 조용히 통과하지 않는다.
+- 회전할 때: pin(로컬) → pin-publish(Actions 변수) → publish(Render 재배포) → pin-check/doctor.
+- 한계: 저장소 파일이 사라졌으므로 **공개 약속(누구나 핀을 확인)** 성질은 없어졌다. 대신 관리자가
+  오프라인에 지문을 적어 두고 주기적으로 pin-remote-check 로 대조하는 것을 권한다.

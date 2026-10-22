@@ -29,6 +29,7 @@ GEMINI_API_KEY 가 없으면 목업으로 응답한다. 그래서 키 없이도 
 """
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import logging
@@ -43,7 +44,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, StringConstraints
@@ -58,6 +59,8 @@ from . import speech_compare as compare
 from . import speech_vad as vad
 from . import stt_providers as stt
 from . import stt_selftest as selftest
+from . import interp
+from . import interp_local
 from .agents.facts import (
     FACT_SOURCES_READY,
     collect_facts,
@@ -115,6 +118,8 @@ async def lifespan(_app: FastAPI):
     threading.Thread(target=warm, name="vad-warmup", daemon=True).start()
     selftest.start()
     evidence.install_log_ring()      # 탈퇴 실패 증거에 최근 로그를 담기 위해(설정이 있을 때만)
+    if "local" in interp.enabled_providers() and interp_local.deps_ok():
+        interp_local.warm_in_background()   # 자체 통역 엔진을 켰으면 모델을 미리 내려받고 불러 둔다(실패해도 서버는 뜬다)
     yield
 
 
@@ -279,6 +284,30 @@ def situation_index() -> dict[str, list[str]]:
     return out
 
 
+def security_review() -> dict[str, Any]:
+    """요청 정책 점검(docs/ops/API_KEY_AND_REQUEST_POLICY.md) 결과를 숨기지 않는다.
+
+    동작을 바꾸지 않고 '지금 무엇이 열려 있는지'만 알린다. 키 이름·값은 여기에도 넣지 않는다.
+    """
+    origins = (os.getenv("ALLOW_ORIGINS") or "").strip()
+    open_cors = origins in ("", "*")
+    managed = bool(os.getenv("RENDER") or os.getenv("K_SERVICE"))   # 관리형 플랫폼(프록시 뒤)인가
+    warns: list[str] = []
+    if open_cors:
+        warns.append("ALLOW_ORIGINS 가 열려 있습니다 — 브라우저에서 아무 사이트나 API 를 부를 수 있습니다.")
+    if managed and TRUSTED_PROXY_HOPS == 0:
+        warns.append("TRUSTED_PROXY_HOPS=0 — 프록시 뒤에서는 모든 사용자가 한 IP 로 묶여 속도 제한이 전체 제한이 됩니다.")
+    warns.append("/generate 는 로그인 없이 호출할 수 있습니다 — 비용이 나가는 경로입니다.")
+    return {
+        "warnings": warns,
+        "cors": "open" if open_cors else "allowlist",
+        "trusted_proxy_hops": TRUSTED_PROXY_HOPS,
+        "rate_limit_scope": "process",      # 인스턴스가 늘면 실효 제한이 늘어난다
+        "key_cooldown_scope": "process",    # 백엔드가 둘이면 쿨다운이 서로 다르다
+        "generate_auth": "none",
+    }
+
+
 def config_problems() -> list[str]:
     """설정 누락을 조용히 넘기지 않는다. 구조 검증이 꺼진 채 돌면 '검증했다'고 말할 수 없다."""
     problems: list[str] = []
@@ -413,6 +442,13 @@ def health() -> dict[str, Any]:
         "stt_models": stt.cached_models(),
         "stt_selftest": selftest.status(),
         "has_api_key": bool(os.getenv("GEMINI_API_KEY")),
+        # 키 여러 개(주 키 → 예비 키, 풀리면 롤백): 개수·지금 쓰는 키 번호·미뤄 둔 키. 키 값은 없다.
+        "gemini_keys": ai.key_health(),
+        # 통역 Azure 엔진의 SDK 를 이 서버에서 불러올 수 있는지(키·켜짐과 별개). 리눅스 라이브러리 확인용.
+        "azure_speech_sdk": interp.azure_sdk_ok(),
+        # 자체 통역 엔진(local): 켜졌는지·패키지·모델 준비 상태(idle/loading/ready/error). docs/ops/INTERP_ENGINES.md
+        "interp_local": {"enabled": "local" in interp.enabled_providers(), "deps": interp_local.deps_ok(),
+                         **interp_local.status()},
         "firebase_auth": firebase_auth.configured(),
         # 탈퇴 관리자 경로(서비스 계정)를 쓸 수 있는지만 알린다. 키 값은 노출하지 않는다.
         "admin_erase": firebase_admin.configured(),
@@ -433,7 +469,9 @@ def health() -> dict[str, Any]:
         # 배포된 코드가 어느 커밋인지 응답 한 번으로 알 수 있게 한다. Render 가 빌드·런타임에 주는 기본 환경변수이고,
         # 로컬 실행처럼 값이 없으면 null 이다. (SHA 는 비밀이 아니다.)
         "deploy": {
-            "commit": os.getenv("RENDER_GIT_COMMIT") or None,
+            "commit": os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or None,   # Cloud Run 은 배포 때 GIT_COMMIT 을 넣는다
+            "platform": "render" if os.getenv("RENDER") else "cloud-run" if os.getenv("K_SERVICE") else None,
+            "revision": os.getenv("K_REVISION") or None,
             "branch": os.getenv("RENDER_GIT_BRANCH") or None,
             "repo": os.getenv("RENDER_GIT_REPO_SLUG") or None,
         },
@@ -441,6 +479,8 @@ def health() -> dict[str, Any]:
         "categories": list_categories(),
         "situations": situation_index(),
         "rate_limit": f"{RATE_LIMIT}/{RATE_WINDOW}s",
+        # 요청 정책 점검: 경고만. 상태(status)에는 영향이 없다.
+        "security_review": security_review(),
     }
 
 
@@ -847,6 +887,33 @@ async def _speak_check(request: Request, target: str, file: UploadFile, situatio
     }
 
 
+@app.get("/interp/providers")
+def interp_providers() -> dict[str, Any]:
+    """실시간 통역 제공자 목록 — 화면의 '통역 엔진' 선택이 쓴다. 키 이름·값은 내려보내지 않는다.
+
+    ws_url: 통역 WebSocket 을 열 주소. Firebase Hosting 은 WebSocket 업그레이드를 중계하지 못하므로(404/400),
+    화면이 Hosting 도메인에서 열렸을 때는 이 값(Cloud Run 직접 URL 또는 Render)으로 붙는다. 없으면 화면과 같은 서버.
+    """
+    return {"providers": interp.provider_list(), "ws_url": interp_ws_url()}
+
+
+def interp_ws_url() -> str | None:
+    """INTERP_WS_URL(예: wss://codyssey-api-xxxx.a.run.app/interp/stream). wss://·ws:// 로 시작하고 /interp/stream 으로 끝날 때만."""
+    raw = (os.getenv("INTERP_WS_URL") or "").strip()
+    if raw.startswith(("wss://", "ws://")) and raw.rstrip("/").endswith("/interp/stream") and " " not in raw:
+        return raw.rstrip("/")
+    return None
+
+
+@app.websocket("/interp/stream")
+async def interp_stream(ws: WebSocket) -> None:
+    """실시간 통역: 브라우저 마이크 PCM 을 제공자에게 중계하고 자막·음성을 돌려준다(서버는 저장하지 않는다)."""
+    def verify(token: str) -> dict[str, str]:
+        return firebase_auth.verify_bearer("Bearer " + token)
+
+    await interp.serve(ws, ip=client_ip(ws), verify=verify)   # WebSocket 도 client·headers 가 있어 같은 규칙
+
+
 @app.get("/auth/config")
 def auth_config() -> dict[str, Any]:
     """브라우저용 Firebase 공개 설정. 비밀이 아니다. 값이 없으면 화면은 데모 로그인을 쓴다."""
@@ -929,6 +996,47 @@ async def user_state_put(request: Request) -> dict[str, Any]:
     return state
 
 
+@app.get("/user/interp-log")
+async def user_interp_log_get(request: Request) -> dict[str, Any]:
+    """이 계정에 저장된 통역 기록(사용자가 '계정에 저장'에 동의했을 때만 있다). 없으면 null."""
+    account, token = await _account_token(request)
+    await _reject_if_erased(account["uid"])
+    try:
+        found = await run_in_threadpool(user_state.read_ilog_for, account["uid"], token)
+    except user_state.StoreError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.code) from exc
+    return {"ilog": found}
+
+
+@app.put("/user/interp-log")
+async def user_interp_log_put(request: Request) -> dict[str, Any]:
+    """통역 기록을 이 계정에 저장한다. 본문에 동의(consent: 버전·시각)가 없으면 거부한다. 음성은 받지 않는다."""
+    account, token = await _account_token(request)
+    await _reject_if_erased(account["uid"])
+    raw = await request.body()
+    if len(raw) > user_state.ILOG_MAX_BYTES + 10_000:
+        raise HTTPException(status_code=413, detail="ilog_too_large")
+    try:
+        ilog = user_state.parse_ilog(json.loads(raw))
+        await run_in_threadpool(user_state.write_ilog_for, account["uid"], token, ilog)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="invalid_ilog") from exc
+    except user_state.StoreError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.code) from exc
+    return {"saved": True, "sessions": len(ilog["list"]), "lines": sum(len(x["lines"]) for x in ilog["list"])}
+
+
+@app.delete("/user/interp-log")
+async def user_interp_log_delete(request: Request) -> dict[str, Any]:
+    """동의 철회·기록 지우기: 이 계정의 통역 기록 필드만 지운다(진도는 그대로). 탈퇴하면 문서째 지워진다."""
+    account, token = await _account_token(request)
+    try:
+        await run_in_threadpool(user_state.delete_ilog_for, account["uid"], token)
+    except user_state.StoreError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.code) from exc
+    return {"deleted": True}
+
+
 @app.delete("/user/state")
 async def user_state_delete(request: Request) -> dict[str, Any]:
     """탈퇴: 이 계정의 기록 문서를 지운다. uid 는 토큰에서 나온다. 없는 문서도 성공이다.
@@ -961,14 +1069,22 @@ async def account_erase(request: Request) -> dict[str, Any]:
     challenge = _challenge_from(request)                 # 클라이언트가 요청 **전에** 만든 값(없으면 서버가 만든다)
     attempt = {}
     if evidence.configured():
-        attempt = await run_in_threadpool(evidence.record_attempt, challenge, account["uid"])
+        # 시도 기록은 반드시 남아야 한다 — 남기지 못하면 아무것도 지우지 않고 멈춘다(재시도 후).
+        # 예전에는 이 예외가 그대로 새어 500 이 됐다. 이제 원인이 드러나는 503 으로 답한다.
+        try:
+            attempt = await _chain_write(evidence.record_attempt, challenge, account["uid"])
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("app.evidence").exception("시도 기록 실패 — 탈퇴를 시작하지 않는다")
+            # 이 실패도 봉인한다. 예전에는 계정 삭제 **전** 실패가 봉인 코드(아래 except)에 닿지 못해
+            # 10/18~19 탈퇴 실패 10건의 증거가 하나도 남지 않았다(관리자 GUI 아카이브 목록이 빔).
+            _seal_in_background("attempt_unrecorded", account["uid"], [],
+                                {"challenge": challenge, "stage": "record_attempt"}, exc)
+            raise HTTPException(status_code=503, detail="evidence_unavailable") from exc
     ledger: list[dict[str, Any]] = []
     try:
         await run_in_threadpool(firebase_admin.erase_account, account["uid"], ledger)
     except (firebase_admin.AdminError, Exception) as exc:   # noqa: BLE001 — 아래에서 상태로 나눈다
-        if evidence.configured():
-            await run_in_threadpool(evidence.record_outcome, challenge, "failed",
-                                    uid=account["uid"], note=getattr(exc, "code", "") or "")
+        await _chain_outcome(challenge, "failed", account["uid"], note=getattr(exc, "code", "") or "")
         _seal_in_background("erase_failed", account["uid"], ledger, None, exc)
         if isinstance(exc, firebase_admin.AdminError):
             raise HTTPException(status_code=exc.status, detail=exc.code) from exc
@@ -976,11 +1092,41 @@ async def account_erase(request: Request) -> dict[str, Any]:
 
     check = await run_in_threadpool(firebase_admin.verify_erased, account["uid"])
     outcome = "ok" if check.get("ok", True) else "verify_mismatch"
-    if evidence.configured():
-        await run_in_threadpool(evidence.record_outcome, challenge, outcome, uid=account["uid"])
+    await _chain_outcome(challenge, outcome, account["uid"])
     if check.get("ok") is False:
         _seal_in_background("verify_mismatch", account["uid"], ledger, check, None)
     return {"erased": True, "receipt": evidence.receipt_for(challenge, attempt, outcome)}
+
+
+CHAIN_RETRY_DELAYS = (0.5, 1.5)   # 증거 체인 쓰기: 첫 시도 + 재시도 2회(일시적 Firestore 오류 대비)
+
+
+async def _chain_write(fn: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    """증거 체인에 한 항목을 쓴다. 실패하면 잠깐 쉬고 다시 쓴다 — 끝내 실패하면 마지막 예외를 그대로 던진다."""
+    for delay in (*CHAIN_RETRY_DELAYS, None):
+        try:
+            return await run_in_threadpool(fn, *args, **kwargs)
+        except Exception:  # noqa: BLE001 — 마지막 시도에서만 밖으로 던진다
+            if delay is None:
+                raise
+            logging.getLogger("app.evidence").warning("증거 체인 쓰기 실패 — %.1fs 뒤 다시 시도", delay)
+            await asyncio.sleep(delay)
+    return {}
+
+
+async def _chain_outcome(challenge: str, outcome: str, uid: str, note: str = "") -> None:
+    """결과 기록(성공·실패 모두). 재시도해도 남기지 못하면 증거로 봉인하고 오류 로그를 남긴다.
+
+    여기까지 왔으면 시도 기록은 이미 체인에 있다. 계정 삭제가 끝난 뒤라면 되돌릴 수 없으므로
+    응답을 '실패'로 바꾸지 않는다 — 지워졌는데 화면이 실패로 안내하는 것이 더 나쁘다.
+    """
+    if not evidence.configured():
+        return
+    try:
+        await _chain_write(evidence.record_outcome, challenge, outcome, uid=uid, note=note)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("app.evidence").error("결과 기록 실패(%s) — 시도 기록만 체인에 남았다", outcome)
+        _seal_in_background("outcome_unrecorded", uid, [], {"challenge": challenge, "outcome": outcome}, exc)
 
 
 def _challenge_from(request: Request) -> str:
@@ -1017,7 +1163,8 @@ async def diagnostics_withdraw(request: Request, payload: WithdrawReport) -> dic
     """
     account, _token = await _account_token(request)
     rate_limit(request)
-    _seal_in_background("client_report", account["uid"], [], {"client": payload.model_dump()}, None)
+    if os.getenv("EVIDENCE_CLIENT_REPORTS") != "0":    # 관리자 마인드맵 client_report 노드로 끌 수 있다
+        _seal_in_background("client_report", account["uid"], [], {"client": payload.model_dump()}, None)
     return {"received": True}
 
 

@@ -13,13 +13,14 @@ import base64
 import getpass
 import json
 import os
+import subprocess
 import tempfile
 import time
 import urllib.request
 import uuid
 
 from . import container as C
-from . import chain, config, firebase, gcp, pins, render, witness
+from . import chain, config, firebase, gcp, kms, kms_audit, pins, render, witness
 
 DEFAULT_ENV_KEY = "EVIDENCE_PUBKEY"
 DEFAULT_DIR = os.path.join(os.path.expanduser("~"), ".opsarchive")
@@ -346,7 +347,7 @@ def _write_json_atomic(path: str, data: dict, *, sort_keys: bool = True) -> None
 
 
 def anchor(project_id: str, sa_path: str, sign_key_file: str, passphrase: str, *,
-           out_dir: str = "checkpoints") -> dict:
+           out_dir: str = "checkpoints", kms_key: str = "", target: str = "local", signer=None) -> dict:
     """지금 저장소의 아카이브 체인을 확인하고, (seq, count, head, 집합 해시)를 **서명해 앵커**한다.
 
     체크포인트를 로컬/저장소에 남긴다 — 앱이 나중에 개수를 줄이거나 head 를 바꾸면 검증에서 걸린다.
@@ -365,7 +366,15 @@ def anchor(project_id: str, sa_path: str, sign_key_file: str, passphrase: str, *
         # 그래서 기본은 거부한다(문제를 먼저 해결해야 한다).
         raise CommandError("chain_broken: " + "; ".join(
             "%s/%s" % (p.get("issue"), p.get("archive_id") or "-") for p in chain_state["problems"][:3]))
-    seed = C.load_private_key(sign_key_file, passphrase)
+    if kms_key or signer is not None:
+        signer = signer or kms.Signer(kms_key, sa_path=sa_path)
+        sign = lambda body: chain.sign_checkpoint_with(signer.sign, signer.public(), body)   # noqa: E731
+    else:
+        seed = C.load_private_key(sign_key_file, passphrase)
+        sign = lambda body: chain.sign_checkpoint(seed, body)                                # noqa: E731
+    if target == "firestore":
+        return _anchor_firestore(store_=gcp.Firestore(project_id, sa_path), metas=metas, entries=entries,
+                                 chain_state=chain_state, sign=sign)
     out_dir = config.resolve(out_dir)
     os.makedirs(out_dir, exist_ok=True)
     lock_fd = _acquire_lock(out_dir)
@@ -380,7 +389,7 @@ def anchor(project_id: str, sa_path: str, sign_key_file: str, passphrase: str, *
                                      created_at=int(time.time()),
                                      entry_ids=[str(e.get("seq", "")) for e in entries],
                                      head_seq=chain_state.get("max_seq"))
-        signed = chain.sign_checkpoint(seed, body)
+        signed = sign(body)
         path = os.path.join(out_dir, "%d.json" % seq)
         _write_json_atomic(path, signed, sort_keys=True)
         # 개별 대조용 목록(아이디만 — 개인정보 없음). 나중에 "앵커한 뒤 사라진 아카이브"와
@@ -400,37 +409,55 @@ def anchor(project_id: str, sa_path: str, sign_key_file: str, passphrase: str, *
 
 
 def verify_chain(project_id: str, sa_path: str, pin_file: str, *, out_dir: str = "checkpoints",
-                 challenge: str = "") -> dict:
+                 challenge: str = "", source: str = "local", pin: dict | None = None,
+                 max_age_hours: float = 0) -> dict:
     """체크포인트 서명·연속성·롤백을 검증하고, 앵커한 뒤 **사라진 아카이브**와
     **제시된 챌린지(사전 커밋먼트)** 가 앵커 범위 안에 있는지 본다."""
-    try:
-        pin = pins.read(config.resolve(pin_file))
-    except FileNotFoundError as exc:
-        raise CommandError("no_pin_file") from exc
-    packed = pin.get("signing_public_key", "")
-    if not packed:
+    if pin is None:
+        try:
+            pin = pins.read(config.resolve(pin_file))
+        except FileNotFoundError as exc:
+            raise CommandError("no_pin_file") from exc
+    signing_keys = pins.signing_keys(pin)
+    if not signing_keys:
         # 신뢰 뿌리(핀의 서명 공개키)가 없으면 체크포인트 서명을 검증할 수 없다.
         raise CommandError("no_signing_key — Render 탭 ⑤ '핀 만들기'에서 **서명 키를 포함해** 핀을 다시 만드세요")
-    signing_public = C.unpack_public_key(packed)
     out_dir = config.resolve(out_dir)
     checkpoints = []
-    for name in sorted(os.listdir(out_dir)) if os.path.isdir(out_dir) else []:
-        if name.endswith(".json") and name[:-5].isdigit():
-            with open(os.path.join(out_dir, name), encoding="utf-8") as fh:
-                checkpoints.append(json.load(fh))
+    anchor_ids: dict = {}
+    if source in ("local", "both"):
+        for name in sorted(os.listdir(out_dir)) if os.path.isdir(out_dir) else []:
+            if name.endswith(".json") and name[:-5].isdigit():
+                with open(os.path.join(out_dir, name), encoding="utf-8") as fh:
+                    checkpoints.append(json.load(fh))
+    if source in ("firestore", "both"):
+        seen = {int(c.get("seq", 0)) for c in checkpoints}
+        for doc in firestore_checkpoints(project_id, sa_path):
+            anchor_ids[int(doc["checkpoint"].get("seq", 0))] = doc.get("archive_ids")
+            if int(doc["checkpoint"].get("seq", 0)) not in seen:
+                checkpoints.append(doc["checkpoint"])
     if not checkpoints:
         raise CommandError("not_found")
     store = gcp.Firestore(project_id, sa_path)
     metas = archives(project_id, sa_path)
     entries = chain_entries(project_id, sa_path)
-    result = chain.verify_chain(checkpoints, signing_public, metas + entries)
+    result = chain.verify_chain(checkpoints, signing_keys, metas + entries)
     result["archives"] = len(metas)
     result["entries"] = len(entries)
 
     latest = max(checkpoints, key=lambda c: int(c.get("seq", 0)))
+    age_hours = round((time.time() - int(latest.get("created_at", 0) or 0)) / 3600, 1)
+    result["last_anchor_seq"] = latest.get("seq")
+    result["last_anchor_age_hours"] = age_hours
+    if max_age_hours and age_hours > max_age_hours:
+        # 자동 앵커가 멈췄다(크론 비활성·권한 만료·KMS 비활성) — 조용히 지나가지 않게 실패로 올린다.
+        result["problems"] = list(result.get("problems") or []) + [{"issue": "anchor_stale", "age_hours": age_hours,
+                                                                     "max_age_hours": max_age_hours}]
+        result["ok"] = False
     anchor_path = os.path.join(out_dir, "anchors", "%s.json" % latest.get("seq"))
-    if os.path.exists(anchor_path):
-        anchored = set(chain.load_archive_ids(anchor_path))
+    remote_ids = anchor_ids.get(int(latest.get("seq", 0)))
+    if remote_ids is not None or os.path.exists(anchor_path):
+        anchored = set(remote_ids if remote_ids is not None else chain.load_archive_ids(anchor_path))
         present = {str(m.get("archive_id", "")) for m in metas}
         result["missing_now"] = sorted(anchored - present)      # 앵커한 뒤 사라졌다 = 삭제 의심
         result["new_since_anchor"] = sorted(present - anchored)
@@ -462,7 +489,7 @@ def archives(project_id: str, sa_path: str, *, limit: int = 300) -> list[dict]:
 
 def chain_entries(project_id: str, sa_path: str, *, limit: int = 300) -> list[dict]:
     """시도·결과 체인 항목(문서가 없으면 빈 목록 — 404 를 오류로 보지 않는다)."""
-    return gcp.Firestore(project_id, sa_path).list("evidence_chain/entries", page_size=limit)
+    return gcp.Firestore(project_id, sa_path).list("evidence_entries", page_size=limit)
 
 
 def observe_requests(project_id: str, sa_path: str, service: str, *, path: str = "/account/erase",
@@ -473,7 +500,7 @@ def observe_requests(project_id: str, sa_path: str, service: str, *, path: str =
     "요청은 왔는데 체인에 시도가 없다"를 드러낸다. 로그 보존 기간이 곧 관측 범위이므로 자주 돌린다.
     """
     store = gcp.Firestore(project_id, sa_path)
-    entries = store.list("evidence_chain/entries", page_size=300)
+    entries = store.list("evidence_entries", page_size=300)
     cutoff = int(time.time()) - max(1, int(since_minutes)) * 60
     attempts = [e for e in entries
                 if str(e.get("kind", "")) == "attempt"
@@ -548,6 +575,87 @@ def make_pin(key_file: str, passphrase: str, *, health_url: str, out: str,
                          generation=generation, health_url=health_url, commit=commit,
                          armed=True, note=note, signing_public=signing_public)
     return pins.write(config.resolve(out), document)
+
+
+def pin_variables(pin_path: str) -> dict:
+    """핀 파일에서 GitHub Actions 변수로 올릴 이름/값을 만든다(공개키·지문만 — 비밀 없음)."""
+    resolved = config.resolve(pin_path)
+    try:
+        pin = pins.read(resolved)
+    except FileNotFoundError as exc:
+        raise CommandError("no_pin_file") from exc          # pin-check 와 같은 코드로 맞춘다
+    import hashlib
+    try:
+        with open(resolved, "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()
+    except OSError as exc:
+        raise CommandError("no_pin_file") from exc
+    return {
+        "EVIDENCE_PIN_FINGERPRINT": str(pin.get("fingerprint_sha256", "")),
+        "EVIDENCE_PIN_GENERATION": str(pin.get("generation", 0)),
+        "EVIDENCE_PIN_KEY_ID": str(pin.get("key_id", "")),
+        "EVIDENCE_PIN_SIGNING_FINGERPRINT": str(pin.get("signing_fingerprint_sha256", "")),
+        "EVIDENCE_PIN_SHA256": digest,
+        "EVIDENCE_PIN_HEALTH_URL": str(pin.get("health_url", "")),
+        # 자동 앵커(CI)가 체크포인트를 검증할 때 쓰는 서명 공개키 묶음(관리자 + KMS 자동 키). 공개값이다.
+        "EVIDENCE_PIN_SIGNING_KEYS": json.dumps(
+            {"admin": pin["signing_public_key"],
+             "auto": [k["public_key"] for k in pin.get("auto_signing_keys") or [] if isinstance(k, dict) and k.get("public_key")]},
+            sort_keys=True, separators=(",", ":")) if pin.get("signing_public_key") else "",
+    }
+
+
+def _run_gh(args: list, timeout: int = 60) -> str:
+    """`gh` CLI 실행(셸 없이). 실패는 값으로 알린다."""
+    try:
+        done = subprocess.run(["gh"] + args, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=timeout, shell=False)  # noqa: S603
+    except (FileNotFoundError, OSError) as exc:
+        raise CommandError("no_gh_cli") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise CommandError("gh_timeout") from exc
+    if done.returncode != 0:
+        raise CommandError("gh_failed: " + (done.stderr or "").strip()[:160])
+    return done.stdout
+
+
+def pin_publish(pin_path: str, *, repo: str, dry_run: bool = False) -> dict:
+    """핀의 공개값을 **GitHub Actions 변수**로 올린다(저장소 파일로는 올리지 않는다).
+
+    공개키·지문이라도 공개 저장소 파일에는 두지 않는다는 결정에 따른 경로다.
+    값은 `gh variable set` 으로 저장소 변수에 들어가고, 변경은 admin 권한이 필요하다.
+    """
+    if not repo:
+        raise CommandError("bad_input:repo")
+    values = pin_variables(pin_path)
+    empty = [name for name, value in values.items() if not str(value).strip()]
+    result = {"repo": repo, "variables": values, "uploaded": [], "dry_run": bool(dry_run),
+              "empty": empty}
+    if dry_run:
+        return result
+    for name, value in values.items():
+        if not str(value).strip():
+            continue                       # 빈 값은 올리지 않는다(변수 미설정 = fail-closed 로 드러나게)
+        _run_gh(["variable", "set", name, "--body", str(value), "--repo", repo])
+        result["uploaded"].append(name)
+    return result
+
+
+def pin_remote_check(pin_path: str, *, repo: str) -> dict:
+    """원격 Actions 변수와 로컬 핀이 일치하는지 본다(불일치면 사람이 올려야 한다)."""
+    if not repo:
+        raise CommandError("bad_input:repo")
+    local = pin_variables(pin_path)
+    raw = _run_gh(["variable", "list", "--repo", repo, "--json", "name,value"])
+    try:
+        remote = {item["name"]: str(item.get("value", "")) for item in json.loads(raw or "[]")}
+    except (ValueError, TypeError) as exc:
+        raise CommandError("gh_bad_json") from exc
+    mismatched = {name: {"local": value, "remote": remote.get(name, "")}
+                  for name, value in local.items() if str(value).strip() and remote.get(name, "") != str(value)}
+    missing = [name for name, value in local.items() if str(value).strip() and not remote.get(name)]
+    return {"repo": repo, "ok": not mismatched and not missing, "mismatched": mismatched,
+            "missing": missing, "checked": sorted(local)}
 
 
 def check_pin(pin_file: str, *, health_url: str = "") -> dict:
@@ -656,3 +764,252 @@ def decrypt_archive(project_id: str, sa_path: str, archive_id: str, key_file: st
             json.dump(report, fh, ensure_ascii=False, indent=2)
         report["_written"] = path
     return report
+
+
+# ------------------------------------------------------------------ Firestore 보안 규칙
+def firebaserc_default(root: str | None = None) -> str:
+    """저장소 `.firebaserc` 의 기본 프로젝트(없으면 빈 문자열). 설정의 project_id 와 다르면 화면이 경고한다."""
+    try:
+        with open(os.path.join(root or config.repo_root(), ".firebaserc"), "r", encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+        return str(((data or {}).get("projects") or {}).get("default") or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def rules_status(project_id: str, sa_path: str, *, root: str | None = None, token_fn=None,
+                 access_token: str = "") -> dict:
+    """저장소 `firestore.rules` 와 **지금 배포된** 규칙을 대조한다(읽기 전용).
+
+    match 가 False 면: 저장소를 고치고 아직 배포하지 않았거나, 누군가 콘솔에서 규칙을 바꿨다(드리프트).
+    match 가 None 이면 배포본을 읽지 못한 것이다(reason 에 이유). 콘솔에서 고친 내용은 CLI 배포가 덮어쓴다.
+    """
+    root = root or config.repo_root()
+    out = {"project": project_id, "rules_file": "", "local_sha256": "",
+           "deployed_sha256": "", "deployed_at": "", "ruleset": "", "match": None, "diff": [], "reason": ""}
+    try:
+        local = firebase.local_rules(root)
+        out.update({"rules_file": local["rules_file"], "local_sha256": local["sha256"][:16]})
+        firebase.check_project(project_id)
+        access = access_token or (token_fn or gcp.token)(sa_path, firebase.RULES_SCOPE)
+        deployed = firebase.deployed_rules(project_id, access)
+    except (firebase.FirebaseError, gcp.GcpError) as exc:
+        out["reason"] = exc.code
+        if exc.code == "rules_forbidden":
+            out["reason"] += " — 서비스 계정에 'Firebase Rules 뷰어'(roles/firebaserules.viewer) 권한이 필요합니다. 콘솔 규칙 탭에서 눈으로 확인할 수도 있습니다"
+        return out
+    out.update({"deployed_sha256": deployed["sha256"][:16], "deployed_at": deployed["updated"],
+                "ruleset": deployed["ruleset"].rsplit("/", 1)[-1], "match": deployed["sha256"] == local["sha256"]})
+    if not out["match"]:
+        out["diff"] = firebase.rules_diff(deployed["text"], local["text"])
+    return out
+
+
+def rules_deploy(project_id: str, sa_path: str = "", *, root: str | None = None, dry_run: bool = False,
+                 verify_seconds: int = 30, token_fn=None, sleep=time.sleep) -> dict:
+    """`firestore.rules` 를 그 프로젝트에 배포하고(**되돌릴 수 없음** — 이전 규칙은 콘솔 기록에만 남는다),
+    배포된 규칙을 다시 읽어 저장소 파일과 같은지 확인한다(반영 확인). dry_run 은 문법 검사만 한다."""
+    root = root or config.repo_root()
+    try:
+        result = firebase.rules_deploy(project_id, root, dry_run=dry_run)
+    except firebase.FirebaseError as exc:
+        failed = {"error": exc.code, "detail": getattr(exc, "detail", "") or "", "project": project_id,
+                  "verified": None}
+        if exc.code == "cli_timeout" and not dry_run and sa_path:
+            failed.update(_verify_release(project_id, sa_path, root, verify_seconds, token_fn, sleep))
+        return failed
+    if dry_run:
+        result["verified"] = None
+        return result
+    result.update(_verify_release(project_id, sa_path, root, verify_seconds, token_fn, sleep) if sa_path else
+                  {"verified": None, "verify_reason": "sa_path 없음 — 반영 확인 생략", "deployed_sha256": ""})
+    if result["verified"] is False:
+        result["error"] = "deployed_rules_differ"
+    elif result["verified"] is None and not (result["released"] or result["unchanged"]):
+        result["error"] = "not_released"     # CLI 는 끝났다는데 release 문구도, 확인할 방법도 없다
+    result["note"] = ("배포본(release)이 저장소와 같습니다. 실제 적용은 새 요청에 약 1분, 열린 연결에는 최대 10분 걸릴 수 있습니다."
+                      if result["verified"] else "")
+    return result
+
+
+# 반영 확인에서 기다려도 바뀌지 않는 이유(권한·설정 문제)는 바로 멈춘다. 네트워크 오류는 다시 시도한다.
+_FINAL_REASONS = ("rules_forbidden", "rules_unauthorized", "rules_not_found", "bad_release", "bad_project",
+                  "no_sa_file", "bad_sa_file", "no_google_auth", "token_failed", "multiple_rules_targets",
+                  "no_rules_target", "no_rules_file", "no_firebase_json", "empty_ruleset")
+
+
+def _verify_release(project_id: str, sa_path: str, root: str, verify_seconds: int, token_fn, sleep) -> dict:
+    """배포 뒤 배포본(release)을 다시 읽어 저장소 파일과 같은지 본다. 토큰은 한 번만 받는다."""
+    status: dict = {}
+    access = ""
+    try:
+        access = (token_fn or gcp.token)(sa_path, firebase.RULES_SCOPE)
+    except gcp.GcpError as exc:
+        return {"verified": None, "verify_reason": exc.code, "deployed_sha256": ""}
+    for _ in range(max(1, verify_seconds // 3)):
+        status = rules_status(project_id, sa_path, root=root, access_token=access)
+        if status["match"]:
+            break
+        if status["match"] is None and status["reason"].split(" ")[0] in _FINAL_REASONS:
+            break
+        sleep(3)                             # release 반영이 늦거나 일시 오류일 수 있어 잠깐 기다렸다 다시 본다
+    return {"verified": status.get("match"), "verify_reason": status.get("reason", ""),
+            "deployed_sha256": status.get("deployed_sha256", ""), "diff": status.get("diff", [])}
+
+
+# ------------------------------------------------------------------ Cloud KMS 자동 앵커
+CHECKPOINTS = "evidence_checkpoints"
+
+
+def _anchor_firestore(*, store_, metas, entries, chain_state, sign, attempts: int = 3) -> dict:
+    """체크포인트를 Firestore `evidence_checkpoints/{seq 8자리}` 에 **만들기만** 한다(덮어쓰기 불가).
+
+    문서 만들기(createDocument)라 같은 seq 가 이미 있으면 서버가 409 로 거부한다 — 동시에 두 번 돌아도
+    하나만 들어가고, 나중 것은 seq 를 다시 정해 한 번 더 시도한다. 아이디 목록(무작위 hex, 개인정보 없음)도 함께 넣는다.
+    """
+    ids = sorted(str(m.get("archive_id", "")) for m in metas)
+    for _ in range(attempts):
+        existing = [int(d.get("checkpoint", {}).get("seq", 0)) for d in _list_checkpoints(store_)]
+        seq = max(existing, default=0) + 1
+        body = chain.checkpoint_body(seq=seq, count=chain_state["count"], head_digest=chain_state["head"],
+                                     archive_ids=ids, created_at=int(time.time()),
+                                     entry_ids=[str(e.get("seq", "")) for e in entries],
+                                     head_seq=chain_state.get("max_seq"))
+        signed = sign(body)
+        doc = {"checkpoint": json.dumps(signed, sort_keys=True), "archive_ids": json.dumps(ids),
+               "challenges": json.dumps(sorted({str(e.get("challenge", "")) for e in entries if e.get("challenge")})),
+               "created_at": int(time.time())}
+        try:
+            # createDocument(POST ?documentId=) — 이미 있으면 409. CI 계정에는 '만들기' 권한만 있으면 된다(수정·삭제 불가).
+            store_._call("POST", store_._root() + "%s?documentId=%08d" % (CHECKPOINTS, seq), gcp.encode_fields(doc))
+        except gcp.GcpError as exc:
+            if getattr(exc, "status", 0) in (400, 409):   # 이미 있는 seq(경합·전제 조건 실패) — 다시 정해 시도
+                continue
+            raise
+        return {"seq": seq, "store": "firestore", "path": "%s/%08d" % (CHECKPOINTS, seq), "count": chain_state["count"],
+                "archives": len(metas), "entries": len(entries), "head": chain_state["head"],
+                "chain_ok": chain_state["ok"], "signing_key_id": signed["signing_key_id"]}
+    raise CommandError("checkpoint_conflict")
+
+
+def _list_checkpoints(store_) -> list[dict]:
+    out = []
+    for item in store_.list(CHECKPOINTS):
+        try:
+            out.append({"checkpoint": json.loads(item.get("checkpoint") or "{}"),
+                        "archive_ids": json.loads(item.get("archive_ids") or "null")})
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def firestore_checkpoints(project_id: str, sa_path: str) -> list[dict]:
+    return _list_checkpoints(gcp.Firestore(project_id, sa_path))
+
+
+def kms_check(kms_key: str, sa_path: str, *, signer=None) -> dict:
+    """KMS 키가 쓸 수 있는지 시험한다: 알고리즘(Ed25519), 공개키, **시험 서명 한 번**과 그 검증."""
+    signer = signer or kms.Signer(kms_key, sa_path=sa_path)
+    public = signer.public()
+    probe = b"opsarchive/kms-check/" + os.urandom(16)
+    signature = signer.sign(probe)
+    return {"kms_key": signer.name, "algorithm": kms.ALGORITHM, "key_id": C.key_id(public).hex(),
+            "fingerprint": C.fingerprint(public), "test_signature_ok": C.verify_signature(public, probe, signature)}
+
+
+def kms_pin_add(pin_path: str, kms_key: str, sa_path: str, *, signer=None) -> dict:
+    """KMS 공개키를 핀의 자동 서명 키로 넣는다. 핀은 신뢰 뿌리라 관리자가 **직접** 넣는다(CI 가 넣지 않는다)."""
+    check = kms_check(kms_key, sa_path, signer=signer)
+    signer = signer or kms.Signer(kms_key, sa_path=sa_path)
+    resolved = config.resolve(pin_path)
+    try:
+        pin = pins.read(resolved)
+    except FileNotFoundError as exc:
+        raise CommandError("no_pin_file") from exc
+    updated = pins.add_auto_key(pin, signer.public(), signer.name)
+    pins.write(resolved, updated)
+    return {**check, "pin": resolved, "auto_keys": len(updated.get("auto_signing_keys") or [])}
+
+
+def pin_from_variables(env: dict | None = None) -> dict:
+    """CI 용 핀: Actions 변수(EVIDENCE_PIN_SIGNING_KEYS)에서 서명 키만 읽는다. 비어 있으면 실패(fail-closed)."""
+    env = os.environ if env is None else env
+    raw = str(env.get("EVIDENCE_PIN_SIGNING_KEYS", "")).strip()
+    try:
+        keys = json.loads(raw) if raw else {}
+    except ValueError as exc:
+        raise CommandError("bad_pin_variables") from exc
+    if not isinstance(keys, dict) or not keys.get("admin"):
+        raise CommandError("no_pin_variables — pin-publish 로 EVIDENCE_PIN_SIGNING_KEYS 를 올리세요")
+    return {"schema": pins.SCHEMA, "signing_public_key": keys["admin"],
+            "auto_signing_keys": [{"public_key": k} for k in keys.get("auto") or []]}
+
+
+def auto_anchor(project_id: str, sa_path: str, kms_key: str, *, max_age_hours: float = 13,
+                env: dict | None = None, signer=None) -> dict:
+    """CI(cron) 한 번: ① 지금까지의 체크포인트 검증(핀 = Actions 변수) ② KMS 로 새 체크포인트를 Firestore 에.
+
+    검증이 실패하면 **새로 앵커하지 않는다** — 문제를 덮어 '정상' 체크포인트를 쌓지 않기 위해서다.
+    처음(체크포인트가 하나도 없음)에는 검증을 건너뛰고 첫 체크포인트를 만든다.
+    """
+    pin = pin_from_variables(env)
+    report: dict = {"verified": None}
+    try:
+        verified = verify_chain(project_id, sa_path, "", source="firestore", pin=pin, max_age_hours=max_age_hours)
+        report["verified"] = verified.get("ok")
+        report["verify"] = {k: verified.get(k) for k in ("ok", "problems", "missing_now", "unanchored",
+                                                          "last_anchor_seq", "last_anchor_age_hours", "signed_by")}
+    except CommandError as exc:
+        if not str(exc.code).startswith("not_found"):
+            raise
+        report["verify"] = {"note": "첫 체크포인트 — 검증할 이전 체크포인트가 없다"}
+    if report["verified"] is False:
+        report["anchored"] = False
+        report["error"] = "verify_failed"
+        return report
+    report["anchor"] = anchor(project_id, sa_path, "", "", kms_key=kms_key, target="firestore", signer=signer)
+    report["anchored"] = True
+    return report
+
+
+def kms_audit_check(project_id: str, sa_path: str, kms_key: str, *, days: float = 7, pin_path: str = "",
+                    out_dir: str = "", token_fn=None, opener=None) -> dict:
+    """KMS 서명 감사 대조: 감사 로그의 서명 기록(누가·언제)과 체크포인트를 맞춰 **짝 없는 서명**을 찾는다.
+
+    읽기 계정에 `roles/logging.privateLogViewer`, 프로젝트에 KMS 데이터 액세스 로그(DATA_READ)가 켜져 있어야 한다.
+    """
+    kms.check_name(kms_key)
+    try:
+        pin = pins.read(config.resolve(pin_path or config.read_settings().get("pin_path") or ""))
+    except FileNotFoundError as exc:
+        raise CommandError("no_pin_file") from exc
+    entry = next((k for k in pin.get("auto_signing_keys") or [] if isinstance(k, dict) and k.get("kms_key") == kms_key), None)
+    if not entry:
+        raise CommandError("kms_key_not_in_pin — 검증 탭 ⑤ 'KMS 점검·핀 추가' 로 먼저 핀에 넣으세요")
+    since = time.time() - float(days) * 86400
+    access = (token_fn or gcp.token)(sa_path, kms_audit.LOGGING_SCOPE)
+    try:
+        events = kms_audit.sign_events(project_id, access, kms_key, since, opener=opener)
+    except kms_audit.AuditError as exc:
+        hint = " — 이 계정에 roles/logging.privateLogViewer 가 필요합니다" if exc.code == "forbidden" else ""
+        return {"error": "audit_" + exc.code + hint, "kms_key": kms_key}
+    checkpoints = [d["checkpoint"] for d in firestore_checkpoints(project_id, sa_path)]
+    local = config.resolve(out_dir or config.read_settings().get("checkpoints_dir") or "")
+    for name in sorted(os.listdir(local)) if local and os.path.isdir(local) else []:
+        if name.endswith(".json") and name[:-5].isdigit():
+            with open(os.path.join(local, name), encoding="utf-8") as fh:
+                checkpoints.append(json.load(fh))           # 관리자가 KMS 키로 손수 만든 로컬 체크포인트도 짝으로 인정
+    checkpoints = [c for c in checkpoints if int(c.get("created_at", 0) or 0) >= since - 300]
+    admins = set()
+    try:
+        with open(sa_path, encoding="utf-8-sig") as fh:
+            admins.add(str(json.load(fh).get("client_email", "")))
+    except (OSError, ValueError, TypeError):
+        pass
+    result = kms_audit.classify(events, checkpoints, key_id=str(entry.get("key_id", "")), admin_principals=admins)
+    result.update({"kms_key": kms_key, "days": days, "since": time.strftime("%Y-%m-%d %H:%M", time.localtime(since))})
+    if result["verdict"] == "violation":
+        result["error"] = "unexplained_signatures — 체크포인트와 짝이 없는 KMS 서명이 있습니다(누가: by_principal·unexplained)"
+    elif result["verdict"] == "logs_missing":
+        result["error"] = "logs_missing — KMS 데이터 액세스 로그(DATA_READ)가 꺼져 있거나 보존 기간 밖입니다"
+    return result

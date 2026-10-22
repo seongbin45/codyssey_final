@@ -28,9 +28,10 @@ class GcpError(Exception):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+        self.status = 0
 
 
-def token(sa_path: str) -> str:
+def token(sa_path: str, scope: str = SCOPE) -> str:
     """서비스 계정 JSON 으로 접근 토큰을 받는다.
 
     google-auth 의 두 트랜스포트(urllib3 → requests)를 차례로 시도하고, 둘 다 없으면 **직접 JWT 를
@@ -39,6 +40,12 @@ def token(sa_path: str) -> str:
     """
     if not sa_path:
         raise GcpError("no_sa_file")
+    if sa_path.startswith("env:"):
+        # CI(Workload Identity Federation)가 받아 둔 **단기 접근 토큰**. 키 파일이 없다.
+        value = os.environ.get(sa_path[4:], "").strip()
+        if not value:
+            raise GcpError("no_env_token")
+        return value
     if not os.path.exists(sa_path):
         raise GcpError("no_sa_file")
     try:
@@ -59,7 +66,7 @@ def token(sa_path: str) -> str:
             imports_failed = True
             continue
         try:
-            creds = service_account.Credentials.from_service_account_file(sa_path, scopes=[SCOPE])
+            creds = service_account.Credentials.from_service_account_file(sa_path, scopes=[scope])
             creds.refresh(getattr(transport, attribute)())
             if creds.token:
                 return creds.token
@@ -67,13 +74,13 @@ def token(sa_path: str) -> str:
             raise GcpError("token_failed") from exc
         imports_failed = True           # import 는 됐지만 토큰이 비었다 → 수동 경로로
 
-    manual = _manual_token(info)
+    manual = _manual_token(info, scope)
     if manual:
         return manual
     raise GcpError("no_google_auth" if imports_failed else "token_failed")
 
 
-def _manual_token(info: dict) -> str:
+def _manual_token(info: dict, scope: str = SCOPE) -> str:
     """OAuth2 JWT 베어러 플로우를 직접 구현한다(RS256). 추가 의존성 없이 동작한다."""
     import base64
     import time as _time
@@ -87,7 +94,7 @@ def _manual_token(info: dict) -> str:
         raise GcpError("bad_sa_file")
     now = int(_time.time())
     header = {"alg": "RS256", "typ": "JWT"}
-    claims = {"iss": client_email, "scope": SCOPE,
+    claims = {"iss": client_email, "scope": scope,
               "aud": "https://oauth2.googleapis.com/token", "iat": now, "exp": now + 3600}
 
     def b64(raw: bytes) -> bytes:
@@ -194,7 +201,9 @@ class Firestore:
             self._token = ""            # 만료·권한 문제는 다음 호출에서 다시 시도한다
             if exc.code == 404:
                 raise GcpError("not_found") from exc    # '없음' 과 '실패' 를 구분한다
-            raise GcpError("http_error") from exc
+            err = GcpError("http_error")
+            err.status = exc.code                       # 409(이미 있음)·403(권한)을 호출자가 구분한다
+            raise err from exc
         except Exception as exc:        # noqa: BLE001
             raise GcpError("http_error") from exc
         if not raw:

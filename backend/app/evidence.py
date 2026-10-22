@@ -19,6 +19,10 @@
 - `EVIDENCE_MAX_BYTES` / `EVIDENCE_MAX_SOURCE_BYTES` / `EVIDENCE_MAX_LOGS_BYTES` : 하드 캡.
 - `EVIDENCE_PER_UID_SECONDS`(기본 3600) / `EVIDENCE_DAILY_CAP`(기본 5) : 남용 방지.
 - `EVIDENCE_TTL_DAYS`(기본 90) : Firestore TTL(`expire_at`) — 이 기간이 지나면 자동 삭제된다.
+- `EVIDENCE_SEAL_FAILURES`(기본 켜짐, "0" 이면 끔) : 탈퇴 실패 증거를 봉인할지.
+- `EVIDENCE_NOTIFY`(기본 켜짐, "0" 이면 끔) : 봉인하면 GitHub 이슈로 알릴지(토큰·저장소가 있어도 끌 수 있다).
+- `EVIDENCE_CLIENT_REPORTS`(기본 켜짐, "0" 이면 끔) : 화면이 보낸 탈퇴 불일치 보고(`/diagnostics/withdraw`)를 봉인할지.
+  위 셋은 관리자 GUI 마인드맵(seal_failures·issue_notify·client_report 노드)이 Render 환경변수로 민다.
 """
 
 from __future__ import annotations
@@ -332,6 +336,10 @@ def collect(trigger: str, *, uid: str = "", ledger: list[dict[str, Any]] | None 
 
 MANIFEST_SCHEMA = "SEAL-SIG-v1"
 DOMAIN_MANIFEST = b"EVIDENCE-SEAL/v1/manifest"
+# 체인 항목 컬렉션. Firestore 문서 경로는 '컬렉션/문서' 쌍이라 마디 수가 짝수여야 한다.
+# 예전 'evidence_chain/entries/{seq}'(3마디)는 400 INVALID_ARGUMENT 로 거절되어 시도 기록이 늘 실패했고,
+# 탈퇴가 계정 삭제 전에 500 으로 멈췄다(10/18 사용자 신고). 읽는 쪽(tools/opsarchive)도 이 이름을 쓴다.
+ENTRIES_COLLECTION = "evidence_entries"
 
 
 def manifest_digest(manifest: dict[str, Any]) -> str:
@@ -393,7 +401,7 @@ def _commit_entry(extra: dict[str, Any]) -> dict[str, Any]:
         **extra,
     }
     entry["digest"] = manifest_digest(entry)
-    admin.firestore("PATCH", "evidence_chain/entries/%d" % entry["seq"], _encode_fields(entry))
+    admin.firestore("PATCH", "%s/%d" % (ENTRIES_COLLECTION, entry["seq"]), _encode_fields(entry))
     admin.firestore("PATCH", "evidence_chain/head", _encode_fields(
         {"seq": entry["seq"], "digest": entry["digest"], "created_at": entry["created_at"],
          "expire_at": entry["created_at"] + _int_env("EVIDENCE_TTL_DAYS", 90) * 86400}))
@@ -467,6 +475,8 @@ def store(blob: bytes, meta: dict[str, Any]) -> dict[str, Any]:
 
 def notify(document: dict[str, Any]) -> bool:
     """GitHub 이슈로 **메타데이터만** 보낸다(본문·키 없음). 토큰/리포가 없으면 건너뛴다."""
+    if os.getenv("EVIDENCE_NOTIFY") == "0":
+        return False                     # 관리자 마인드맵 issue_notify 노드로 껐다
     token = (os.getenv("EVIDENCE_GH_TOKEN") or "").strip()
     repo = (os.getenv("EVIDENCE_GH_REPO") or "").strip()
     if not token or not repo:
