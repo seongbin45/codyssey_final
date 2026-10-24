@@ -2,7 +2,8 @@
   "firestore": [
     {
       "database": "(default)",
-      "rules": "firestore.rules"
+      "rules": "firestore.rules",
+      "indexes": "firestore.indexes.json"
     }
   ],
   "hosting": {
@@ -53,6 +54,18 @@
           {
             "key": "Referrer-Policy",
             "value": "strict-origin-when-cross-origin"
+          },
+          {
+            "key": "X-Frame-Options",
+            "value": "DENY"
+          },
+          {
+            "key": "Permissions-Policy",
+            "value": "microphone=(self), camera=(), geolocation=()"
+          },
+          {
+            "key": "Content-Security-Policy-Report-Only",
+            "value": "default-src 'self'; script-src 'self' https://www.gstatic.com https://apis.google.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net; font-src 'self' https://fonts.gstatic.com https://cdn.jsdelivr.net; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' blob: https://identitytoolkit.googleapis.com https://securetoken.googleapis.com wss://*.run.app; frame-src 'self' https://*.firebaseapp.com; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
           }
         ]
       }
@@ -95,6 +108,13 @@
       },
       {
         "source": "/auth/**",
+        "run": {
+          "serviceId": "codyssey-api",
+          "region": "asia-northeast3"
+        }
+      },
+      {
+        "source": "/geo/**",
         "run": {
           "serviceId": "codyssey-api",
           "region": "asia-northeast3"

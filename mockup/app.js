@@ -61,7 +61,8 @@ const KIND = {
   free: { label: '자유 일정', cls: 'k-free' },
   drill: { label: '상황별 연습', cls: 'k-review' },
 };
-const ENGLISH_COUNTRIES = ['미국', '영국', '캐나다', '호주', '뉴질랜드', '아일랜드', '싱가포르', '필리핀', '몰타'];
+// '오스트레일리아' 는 나라 목록(GeoNames)의 한국어 이름 — 목록을 아직 못 받았을 때도 영어권으로 본다. 목록이 있으면 isEnglishCountry 가 ISO 코드로 본다.
+const ENGLISH_COUNTRIES = ['미국', '영국', '캐나다', '호주', '오스트레일리아', '뉴질랜드', '아일랜드', '싱가포르', '필리핀', '몰타'];
 const STAGE_OBJ = { report: '보고서를', route: '방문 순서를', sentences: '문장과 일정표를' };
 const STAGE_NAME = { report: '보고서', route: '방문 순서', sentences: '문장·일정표' };
 const STATUS_KO = {
@@ -676,7 +677,7 @@ function archiveTrip() {
   S.trip.archived = true;
   S.archived.unshift({ id: S.trip.id, route: tripTitle(S.trip), dates: `${Dt.md(S.trip.tripStart)}~${Dt.md(S.trip.tripEnd)}` });
 }
-function resetCard(date = null) { S.card = { date, i: 0, flipped: new Set() }; S.sheet = false; }
+function resetCard(date = null) { S.card = { date, i: 0, alarm: true, flipped: new Set() }; S.sheet = false; }
 
 /* ---------- 보고서 (AI-01 흉내) ---------- */
 function genReport(t, round) {
@@ -2126,7 +2127,9 @@ function tripFields(d, E, v) {
   const cities = d.cities.map((c, i) => `
     <div class="city-card"><span class="num">CITY ${i + 1}</span>
       ${d.cities.length > 1 ? `<button class="del" data-act="del-city" data-i="${i}" title="삭제">${I.x}</button>` : ''}
-      <input class="input name-input" data-bind="city.${i}.name" value="${esc(c.name)}" placeholder="도시 이름">
+      <div class="geo-pick"><input class="input name-input" data-bind="city.${i}.name" data-geo="city.${i}" value="${esc(c.name)}" placeholder="도시 이름"
+        role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="geo-list-city-${i}" aria-label="도시 ${i + 1} 이름" autocomplete="off">
+        <ul class="geo-list" id="geo-list-city-${i}" role="listbox" aria-label="도시 ${i + 1} 목록" hidden></ul></div>
       <div class="err" data-err="cn${i}">${E['cn' + i] || ''}</div>
       <div class="row2">
         <div><span class="lbl">체류 시작일</span><input type="date" class="input" data-bind="city.${i}.start" value="${c.start}"></div>
@@ -2134,9 +2137,13 @@ function tripFields(d, E, v) {
       </div>
       <div class="err" data-err="cd${i}">${E['cd' + i] || ''}</div>
     </div>`).join('');
-  return `<div class="field"><label>나라</label><input class="input" data-bind="country" value="${esc(d.country)}" placeholder="예: 미국">
+  return `<div class="field"><label for="geo-country">나라</label><div class="geo-pick">
+        <input class="input" id="geo-country" data-bind="country" data-geo="country" value="${esc(d.country)}" placeholder="예: 미국"
+          role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="geo-list-country" autocomplete="off">
+        <ul class="geo-list" id="geo-list-country" role="listbox" aria-label="나라 목록" hidden></ul></div>
       <div class="err" data-err="country">${E.country || ''}</div>
-      <div data-live="noneng" style="margin-top:8px;${d.country.trim() && !ENGLISH_COUNTRIES.includes(d.country.trim()) ? '' : 'display:none'}">${notice('현지에서 영어가 통하지 않을 수 있어요. 문장은 여행자가 흔히 쓰는 쉬운 영어로 만들어요.', 'warn')}</div>
+      <div class="hint">칸을 누르면 나라·도시 목록이 나와요. 목록에 없으면 그대로 적어도 돼요.</div>
+      <div data-live="noneng" style="margin-top:8px;${d.country.trim() && !isEnglishCountry(d.country) ? '' : 'display:none'}">${notice('현지에서 영어가 통하지 않을 수 있어요. 문장은 여행자가 흔히 쓰는 쉬운 영어로 만들어요.', 'warn')}</div>
     </div>
     <div class="field"><label>도시와 체류 날짜 <span class="small">(1~5곳)</span></label>
       ${cities}
@@ -2178,10 +2185,162 @@ function inputSummary(d) {
 function updateInputLive() {
   const d = S.draft, v = R.validate(d, S.today);
   const s = $('[data-live=summary]'); if (s) s.innerHTML = inputSummary(d);
-  const n = $('[data-live=noneng]'); if (n) n.style.display = d.country.trim() && !ENGLISH_COUNTRIES.includes(d.country.trim()) ? '' : 'none';
+  const n = $('[data-live=noneng]'); if (n) n.style.display = d.country.trim() && !isEnglishCountry(d.country) ? '' : 'none';
   const w = $('[data-live=warn]'); if (w) w.innerHTML = v.warnings.map(x => notice(x, 'warn')).join('');
   if (S.showErrors) document.querySelectorAll('[data-err]').forEach(el => (el.textContent = v.errors[el.dataset.err] || ''));
 }
+
+/* ================= 나라·도시 선택 목록 (geo) =================
+   geo-refresh 워크플로우가 Firestore 에 쌓은 GeoNames 데이터(docs/ops/GEO_REFRESH.md)를 백엔드 /geo/* 로 받는다.
+   - 칸은 그대로 글자 입력이다(목록에 없는 곳도 적을 수 있다). 포커스·입력 때 아래에 목록을 보여 주고 고르면 채운다.
+   - 나라는 목록을 한 번 받아 화면에서 거르고, 도시는 고른 나라 안에서 서버가 이름(영문·한국어)으로 찾는다.
+   - 서버가 없거나(폴백 전용) 목록을 못 받으면 목록 없이 예전처럼 글자 입력만 된다.
+   - 접근성: role=combobox + listbox, ↑↓ 로 이동, Enter 로 고르기, Esc 로 닫기. */
+const ENGLISH_ISO = ['US', 'GB', 'CA', 'AU', 'NZ', 'IE', 'SG', 'PH', 'MT'];
+// 사람들이 흔히 쓰는 다른 이름(GeoNames 한국어 이름과 다른 것) — 검색과 '영어권' 판정에 쓴다.
+const COUNTRY_ALIAS = { AU: ['호주'], US: ['미합중국', '아메리카'], GB: ['잉글랜드', '브리튼', '영국연합'], NL: ['홀랜드'],
+  CZ: ['체코'], VN: ['월남'], AE: ['아랍에미리트', '두바이'], TW: ['타이완'], KR: ['한국', '남한'] };
+const GEO = { countries: null, loading: null, failed: false, cities: new Map(), open: null, seq: 0, timer: null, keep: null };
+const geoNorm = s => String(s || '').toLowerCase().replace(/\s+/g, '');
+function geoCountries() {
+  if (GEO.countries) return Promise.resolve(GEO.countries);
+  if (GEO.failed || API.base === null) return Promise.resolve(null);
+  if (!GEO.loading) {
+    GEO.loading = fetch(API.base + '/geo/countries').then(r => (r.ok ? r.json() : Promise.reject(r.status)))
+      .then(b => (GEO.countries = (b.countries || []).map(c => ({ ...c, _k: [c.ko, c.name, c.iso2, ...(COUNTRY_ALIAS[c.iso2] || [])].map(geoNorm) }))))
+      .catch(() => { GEO.failed = true; return null; })
+      .finally(() => { GEO.loading = null; });
+  }
+  return GEO.loading;
+}
+/* 적힌 나라 이름(한국어·영문·별칭)으로 목록의 나라를 찾는다. 못 찾으면 null(자유 입력). */
+function countryByName(name) {
+  const k = geoNorm(name);
+  return k && GEO.countries ? GEO.countries.find(c => c._k.includes(k)) || null : null;
+}
+function isEnglishCountry(name) {
+  const n = String(name || '').trim();
+  if (ENGLISH_COUNTRIES.includes(n)) return true;
+  const c = countryByName(n);
+  return !!c && ENGLISH_ISO.includes(c.iso2);
+}
+function geoKey(el) { return el.dataset.geo; }
+function geoListEl(el) { return document.getElementById(el.getAttribute('aria-controls')); }
+function geoClose(onlyKey) {
+  const o = GEO.open;
+  if (!o || (onlyKey && o.key !== onlyKey)) return;      // 다른 칸의 목록은 건드리지 않는다(칸을 옮길 때 늦게 오는 닫기)
+  GEO.open = null;
+  const el = document.querySelector(`[data-geo="${o.key}"]`), ul = el && geoListEl(el);
+  if (el) { el.setAttribute('aria-expanded', 'false'); el.removeAttribute('aria-activedescendant'); }
+  if (ul) { ul.hidden = true; ul.innerHTML = ''; }
+}
+function geoRender(el, items, note) {
+  const ul = geoListEl(el); if (!ul) return;
+  const key = geoKey(el), isCountry = key === 'country';
+  GEO.open = { key, items, active: -1 };
+  const opts = items.map((it, i) => isCountry
+    ? `<li role="option" id="${ul.id}-o${i}" class="geo-opt" data-geo-i="${i}" aria-selected="false"><b>${esc(it.ko || it.name)}</b><small>${esc(it.name)}</small></li>`
+    : `<li role="option" id="${ul.id}-o${i}" class="geo-opt" data-geo-i="${i}" aria-selected="false"><b>${esc(it.label)}</b><small>${esc([it.label !== it.name ? it.name : '', it.region, it.population >= 10000 ? `인구 ${fmtPop(it.population)}` : ''].filter(Boolean).join(' · '))}</small></li>`).join('');
+  ul.innerHTML = (opts || '') + (note ? `<li class="geo-note" role="presentation">${note}</li>` : '')
+    + (items.length ? `<li class="geo-note geo-src" role="presentation">출처: GeoNames (CC BY 4.0)</li>` : '');
+  const show = !!(opts || note);
+  ul.hidden = !show;
+  el.setAttribute('aria-expanded', show ? 'true' : 'false');
+}
+function fmtPop(n) { return n >= 10000 ? `${Math.round(n / 10000).toLocaleString('ko-KR')}만` : n.toLocaleString('ko-KR'); }
+function geoMove(el, d) {
+  const o = GEO.open; if (!o || !o.items.length) return;
+  o.active = (o.active + d + o.items.length) % o.items.length;
+  const ul = geoListEl(el);
+  ul.querySelectorAll('.geo-opt').forEach((li, i) => li.setAttribute('aria-selected', i === o.active ? 'true' : 'false'));
+  const cur = ul.querySelector(`[data-geo-i="${o.active}"]`);
+  if (cur) { el.setAttribute('aria-activedescendant', cur.id); cur.scrollIntoView({ block: 'nearest' }); }
+}
+function geoPick(el, i) {
+  const o = GEO.open; if (!o || !o.items[i]) return;
+  const it = o.items[i], key = geoKey(el);
+  const value = key === 'country' ? (it.ko || it.name) : it.label;
+  el.value = value;
+  if (key === 'country') S.draft.country = value; else S.draft.cities[+key.split('.')[1]].name = value;
+  geoClose();
+  updateInputLive();
+}
+async function geoQuery(el) {
+  const key = geoKey(el), q = el.value.trim(), seq = ++GEO.seq;
+  const countries = await geoCountries();
+  if (seq !== GEO.seq || document.activeElement !== el) return;
+  if (!countries) { geoClose(); return; }                       // 목록을 못 받으면 글자 입력만
+  if (key === 'country') {
+    const k = geoNorm(q);
+    const items = (k ? countries.filter(c => c._k.some(x => x.startsWith(k))).concat(countries.filter(c => !c._k.some(x => x.startsWith(k)) && c._k.some(x => x.includes(k)))) : countries).slice(0, 60);
+    geoRender(el, items, items.length ? '' : '목록에 없어요 — 적은 그대로 써도 돼요.');
+    return;
+  }
+  const c = countryByName(S.draft.country);
+  if (!c) { geoRender(el, [], S.draft.country.trim() ? '나라를 목록에서 고르면 도시 목록이 나와요.' : '나라를 먼저 고르세요.'); return; }
+  const ck = c.iso2 + '|' + geoNorm(q);
+  let items = GEO.cities.get(ck);
+  if (!items) {
+    try {
+      const r = await fetch(`${API.base}/geo/cities?country=${c.iso2}&limit=20&q=${encodeURIComponent(q)}`);
+      items = r.ok ? (await r.json()).cities || [] : [];
+    } catch (e) { items = []; }
+    if (GEO.cities.size > 200) GEO.cities.clear();
+    GEO.cities.set(ck, items);
+  }
+  if (seq !== GEO.seq || document.activeElement !== el) return;
+  geoRender(el, items, items.length ? '' : (q ? '목록에 없어요 — 적은 그대로 써도 돼요.' : ''));
+}
+function geoQueryLater(el) {
+  clearTimeout(GEO.timer);
+  GEO.timer = setTimeout(() => geoQuery(el), geoKey(el) === 'country' ? 0 : 180);   // 도시는 입력이 멈추면 한 번
+}
+document.addEventListener('focusin', e => {
+  const el = e.target;
+  if (!el.dataset || !el.dataset.geo) return;
+  if (GEO.open && GEO.open.key === el.dataset.geo) return;   // 목록을 만지다 칸으로 돌아온 것 — 다시 그리면 스크롤 위치가 날아간다
+  geoQuery(el);
+});
+document.addEventListener('focusout', e => {
+  const el = e.target;
+  if (el.dataset && el.dataset.geo) setTimeout(() => { if (document.activeElement !== el && !GEO.keep) geoClose(el.dataset.geo); }, 120);
+});
+document.addEventListener('keydown', e => {
+  const el = e.target;
+  if (!el.dataset || !el.dataset.geo) return;
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    if (!GEO.open) { geoQuery(el); return; }
+    e.preventDefault(); geoMove(el, e.key === 'ArrowDown' ? 1 : -1);
+  } else if (e.key === 'Enter' && GEO.open && GEO.open.active >= 0) {
+    e.preventDefault(); geoPick(el, GEO.open.active);
+  } else if (e.key === 'Escape' && GEO.open) {
+    e.preventDefault(); geoClose();
+  }
+});
+// 목록 조작: 고르기는 click 에서 한다 — 손가락을 대고 끌면(스크롤) click 이 나지 않으므로 스크롤하려다 고르지 않는다.
+// (예전에는 pointerdown 에서 고르고 기본 동작을 막아, 휴대폰에서 목록을 스크롤할 수 없었다.)
+// 누르고 있는 동안(스크롤바 끌기·손가락 스크롤)은 칸이 포커스를 잃어도 목록을 닫지 않고, 떼면 칸으로 포커스를 돌린다.
+// 마우스로 항목을 누를 때만 기본 동작을 막아 칸의 포커스를 지킨다(터치는 막지 않는다 — 막으면 스크롤이 안 된다).
+document.addEventListener('pointerdown', e => {
+  const ul = e.target.closest && e.target.closest('.geo-list');
+  if (!ul) return;
+  GEO.keep = ul.id;
+  if (e.pointerType === 'mouse' && e.target.closest('.geo-opt')) e.preventDefault();
+});
+function geoRelease() {
+  if (!GEO.keep) return;
+  const id = GEO.keep; GEO.keep = null;
+  const el = document.querySelector(`[aria-controls="${id}"]`);
+  if (el && GEO.open && GEO.open.key === el.dataset.geo && document.activeElement !== el) el.focus({ preventScroll: true });
+}
+document.addEventListener('pointerup', () => setTimeout(geoRelease, 0));   // click(고르기) 뒤에 돈다
+document.addEventListener('pointercancel', geoRelease);                    // 손가락 스크롤은 pointercancel 로 끝난다
+document.addEventListener('click', e => {
+  const li = e.target.closest && e.target.closest('.geo-opt');
+  if (!li) return;
+  const el = document.querySelector(`[aria-controls="${li.parentElement.id}"]`);
+  if (el) geoPick(el, +li.dataset.geoI);
+});
 
 /* SCR-03 */
 function scrGen() {
@@ -2235,7 +2394,7 @@ function scrReport() {
   const meta = S.reportMeta[city] || { base: 0, found: 0, mode: S.reportMode === 'example' ? 'example' : 'empty' };
   const sel = selCount(city);
   const base = S.places.filter(p => p.city === city && !p.isCandidate), cands = S.places.filter(p => p.city === city && p.isCandidate);
-  const nonEng = !ENGLISH_COUNTRIES.includes(t.country);
+  const nonEng = !isEnglishCountry(t.country);
   const total = S.places.filter(p => p.selected).length;
   const open = S.showCand[city] || cands.some(p => p.selected);
   const tabCount = c => `${selCount(c.name)}/${(S.reportMeta[c.name] || { base: 0 }).base}`;
@@ -2450,23 +2609,38 @@ function alarmCard(pr, o = {}) {
     : n ? `카드 ${DAY_GOAL - n}장만 더 뒤집으면 오늘 목표`
     : st ? '오늘 카드를 뒤집으면 연속이 이어져요' : '오늘 카드를 뒤집어 시작해 보세요';
   const days = Array.from({ length: 7 }, (_, i) => Dt.add(S.today, i - 6));
+  /* 막대 높이가 그날 학습량이 되도록 --n 을 넘긴다(세로형에서만 쓰인다. 가로형은 눈금).
+     막대 아래에 요일 이름을 붙인다 — 남는 공간이 있을 때만 CSS 가 보여 준다. */
+  const WD = ['일', '월', '화', '수', '목', '금', '토'];
+  const wdOf = d => WD[new Date(d + 'T00:00:00').getDay()];
   const week = days.map(d => {
-    const on = (PROG.act[d] || 0) > 0;
-    return `<i class="${on ? 'on' : ''}${d === S.today ? ' today' : ''}" title="${Dt.md(d)}${on ? ' · 학습함' : ''}"></i>`;
+    const c = PROG.act[d] || 0, on = c > 0;
+    return `<i class="${on ? 'on' : ''}${d === S.today ? ' today' : ''}" style="--n:${Math.min(c, 7)}" title="${Dt.md(d)}${on ? ` · ${c}장` : ''}"></i>`;
   }).join('');
-  return `<div class="alarm" data-live="alarm">
+  const wdLabels = days.map(d => {
+    const on = (PROG.act[d] || 0) > 0;
+    return `<b class="${on ? 'on' : ''}${d === S.today ? ' today' : ''}">${wdOf(d)}</b>`;
+  }).join('');
+  const pr2 = pr, pct = Math.round(pr2.rate * 100);
+  return `<div class="alarm-wrap"><div class="alarm" data-live="alarm">
     <div class="alarm-h"><span class="alarm-ic">${ALARM_IC}</span>오늘의 알람</div>
     <b class="alarm-big">${n}<i>/${DAY_GOAL}장</i></b>
     <p class="alarm-label">${sub}</p>
     <div class="alarm-week" role="group" aria-label="최근 7일">${week}</div>
-    <div class="alarm-meta"><span>🔥 연속 ${st}일</span><span aria-hidden="true">·</span><span>여행 전체 ${Math.round(pr.rate * 100)}%</span></div>
+    <div class="alarm-days" aria-hidden="true">${wdLabels}</div>
+    <div class="alarm-prog">
+      <span class="alarm-plabel">완료율</span>
+      <div class="alarm-rail" role="img" aria-label="완료율 ${pct}% · 완료 ${pr2.done}일, 학습 ${pr2.den}일, 미완료 ${pr2.miss}일"><i style="width:${pct}%"></i></div>
+      <span class="alarm-count"><b>${pr2.done}</b>/${pr2.den}일</span>
+    </div>
+    <div class="alarm-meta"><span>🔥 연속 ${st}일</span></div>
     <div class="alarm-acts">
       ${o.inDeck
         ? `<button class="alarm-primary" data-act="alarm-next">${done ? '다시 보기' : '학습 시작'}</button>`
         : `<button class="alarm-primary" data-act="study-date" data-date="${date}">${done ? '다시 보기' : '학습 시작'}</button>`}
       <button class="alarm-second" data-act="tab" data-id="u-sched">일정표 열기</button>
     </div>
-  </div>`;
+  </div></div>`;
 }
 
 function ring(rate) {
@@ -3529,7 +3703,7 @@ const weakItem = s => ({ category_id: s.categoryId, id: s.situationId, situation
 function updateSpeakUi() {
   if (TALK.on) updateTalkUi();
   const r = studyShown() && pickRow();
-  if (!r) return;
+  if (!r || deckAlarmOn(r)) return;          // 알람 장에는 말하기 대상 문장이 없다
   const s = S.smap[r.ids[deckIdx(r)]];
   if (!s) return;
   const f = document.activeElement && document.activeElement.closest && document.activeElement.closest('[data-live="speak-btn"]') ? document.activeElement.closest('[data-live="speak-btn"]').dataset.k : null;
@@ -3552,7 +3726,8 @@ async function toggleSpeak(opt) {
   if (SPK.state === 'requesting' || SPK.state === 'uploading') return;      // 중복 요청 방지
   if (SPK.state === 'recording') { stopSpeak(); return; }
   if (!voiceConsent().voice) { askVoiceConsent(opt ? () => toggleSpeak(opt) : null); return; }   // 동의 전에는 마이크도 열지 않는다
-  const r = pickRow(); const s = r && S.smap[r.ids[deckIdx(r)]]; if (!s) return;
+  const r = pickRow(); if (!r || deckAlarmOn(r)) return;   // 알람 장에서 녹음을 시작하지 않는다
+  const s = S.smap[r.ids[deckIdx(r)]]; if (!s) return;
   cancelSpeak();
   if (ttsSupported()) { try { speechSynthesis.cancel(); } catch (e) { /* 이미 멈춤 */ } }   // 원어민 듣기가 녹음에 섞이지 않게
   const tok = SPK.tok; SPK.sid = s.id; SPK.line = (opt && opt.line) || 'me'; SPK.state = 'requesting'; updateSpeakUi();
@@ -4142,7 +4317,7 @@ const ACT = {
       render(); renderDemo(); toast(ok ? '복습 목록을 지웠어요.' : '브라우저 저장소에 접근하지 못했어요.');
     }, { danger: true }),
   'weak-save': () => {
-    const r = pickRow(); const s = r && S.smap[r.ids[deckIdx(r)]];
+    const r = pickRow(); const s = r && !deckAlarmOn(r) && S.smap[r.ids[deckIdx(r)]];
     if (!s || SPK.sid !== s.id || !SPK.result || !SPK.result.offer) return;       // 다른 카드·취소된 결과에는 저장하지 않는다
     saveWeakList(AI.upsertWeak(weakList(), weakItem(s)));
     SPK.result = { ...SPK.result, offer: false, saved: true, savedBy: 'user' }; updateSpeakUi(); renderDemo(); toast('복습 목록에 저장했어요.');
@@ -4544,6 +4719,7 @@ document.addEventListener('input', e => {
     const k = el.dataset.bind.split('.');
     if (k[0] === 'city') S.draft.cities[+k[1]][k[2]] = el.value; else S.draft[k[0]] = el.value;
     updateInputLive();
+    if (el.dataset.geo) geoQueryLater(el);
   }
   if (el.dataset.cs) {
     const [gi, ii, f] = el.dataset.cs.split('.');

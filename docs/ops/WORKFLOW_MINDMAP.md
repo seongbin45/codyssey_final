@@ -21,7 +21,7 @@
 | id | 그룹 | 종류 | 기본값 | 연결 env | 재배포 필요 | 실행 가능 |
 |---|---|---|---|---|---|---|
 | `seal_failures` | 탈퇴 대응 | toggle | `True` | `EVIDENCE_SEAL_FAILURES` | 필요 | ✘ (env 밀어넣기 노드) |
-| `daily_cap` | 탈퇴 대응 | number | `50` (1~100000) | `EVIDENCE_DAILY_CAP` | 필요 | ✘ |
+| `daily_cap` | 탈퇴 대응 | number | `5` (1~100000) | `EVIDENCE_DAILY_CAP` | 필요 | ✘ |
 | `per_uid_seconds` | 탈퇴 대응 | number | `60` (1~86400) | `EVIDENCE_PER_UID_SECONDS` | 필요 | ✘ |
 | `ttl_days` | 탈퇴 대응 | number | `30` (1~3650) | `EVIDENCE_TTL_DAYS` | 필요 | ✘ |
 | `issue_notify` | 탈퇴 대응 | toggle | `True` | — | 불필요 | ✘ (안내 노드) |
@@ -47,7 +47,7 @@
 | 노드 id | 미는 env | 값 형식 | 앱이 읽는가 | 앱 근거(evidence.py) | 앱 기본값 |
 |---|---|---|---|---|---|
 | `seal_failures` | `EVIDENCE_SEAL_FAILURES` | `"1"`/`"0"` (toggle) | **아니오 — 지금은 효과 없음(개념 노드)** | evidence.py 에 문자열 없음(봉인 on/off 는 `EVIDENCE_PUBKEY` 유무로 결정) | — |
-| `daily_cap` | `EVIDENCE_DAILY_CAP` | 정수 (`str(값)`) | 예 | 523행 `_int_env("EVIDENCE_DAILY_CAP", 5)` | **5** (노드 기본 50과 다름) |
+| `daily_cap` | `EVIDENCE_DAILY_CAP` | 정수 (`str(값)`) | 예 | 523행 `_int_env("EVIDENCE_DAILY_CAP", 5)` | **5** (서버 감지 예산. 화면 보고는 `EVIDENCE_CLIENT_DAILY_CAP` 별도) |
 | `per_uid_seconds` | `EVIDENCE_PER_UID_SECONDS` | 정수 | 예 | 525행 `_int_env("EVIDENCE_PER_UID_SECONDS", 3600)` | **3600** (노드 기본 60과 다름) |
 | `ttl_days` | `EVIDENCE_TTL_DAYS` | 정수 | 예 | 399·464·562행 `_int_env("EVIDENCE_TTL_DAYS", 90)` | **90** (노드 기본 30과 다름) |
 | `include_secrets` | `EVIDENCE_INCLUDE_SECRETS` | `"1"`/`"0"` | 예 (문자열 `"1"` 일 때만) | 167행 `os.getenv("EVIDENCE_INCLUDE_SECRETS") == "1"` | 꺼짐 |
@@ -195,6 +195,11 @@ root.destroy()
 - ~~서버 측 정책을 GUI 가 못 바꾼다~~ → **해결**: 노드 추가·연결 — `gh_repo`(text, `EVIDENCE_GH_REPO`, owner/repo 형식 검사), `gh_token`(secret, `EVIDENCE_GH_TOKEN`, 반영 때 가려진 칸으로 받고 **저장·로그 안 함**), `pubkey`(key, `EVIDENCE_PUBKEY` — 키 파일에서 역산하는 공개키 발행으로 연결), `max_source_bytes`·`max_logs_bytes`(number). `key_generation`·`max_bytes` 는 이미 있다. 앱이 읽는 `EVIDENCE_*` 변수 중 노드가 없는 것은 없다.
 - **`observe` 는 플랫폼 로그 보존 기간만큼만** 본다(그보다 오래된 구간은 안 보인다).
 - **[정책 다시 읽기] 버튼의 코드 불일치** — gui.py 392행이 호출하는 `workflow.policy_path()` 는 `workflow.py` 에 **없다**(존재하는 이름은 `workflow_path`). 이 버튼은 클릭 시 `AttributeError` 가 날 수 있다(코드에서 직접 확인; 다른 버튼은 `workflow.load()` 사용).
+- **자동 반영(2026-10-23, 기본 켜짐)**: 노드 값을 바꾸면 즉시 정책에 저장하고, 서버 환경변수 노드면 Render 에 바뀐 것만 올려 재배포·반영 확인까지 한다(묻지 않음). 연달아 바꾸면 마지막 변경 1.5초 뒤 **한 번만** 재배포한다. 토글·선택은 바꾸는 즉시, 숫자·글자는 Enter 나 칸을 벗어날 때 저장한다. 비밀(`gh_token`)·키(`pubkey`) 노드는 자동으로 올리지 않는다.
+  - 끄고 켜기: GUI `[자동 반영: 켜짐/꺼짐]` 토글(버튼 줄 아래) · CLI `python -m opsarchive auto-apply on|off|status` · TUI 메뉴 7. 셋 다 `settings.json` 의 `auto_apply` 를 쓴다.
+  - 환경변수 `OPSARCHIVE_AUTO_APPLY=1|0` 이 있으면 그것이 우선한다(CI·스크립트·일회성). 이때 GUI 토글은 잠긴다.
+  - CLI 로 값 바꾸기: `policy-set <노드> <값>`(자동 반영이 켜져 있으면 Render 까지, `--no-apply`/`--apply` 로 이번만 바꿈) · `policy-apply`(변경 모아 반영) · `policy-show`.
+  - 꺼져 있으면 예전처럼 `[정책에 저장]` → `[Render에 반영]`/`[변경 모아 반영]` 을 직접 누른다.
 - **공개키는 값으로 넣지 않는다** — `pubkey` 노드는 키 파일·패스프레이즈가 필요한 발행 흐름이라 [변경 모아 반영] 에 포함되지 않는다(따로 실행).
 - **번호 노드 최소값 1** — `per_uid_seconds`/`daily_cap`/`ttl_days` 는 1 미만으로 내려가지 않는다(끄기 개념이 없다).
 - **문서-코드 어긋남 경고**: 이 문서는 특정 커밋의 코드를 읽고 작성했다. 값·규칙이 바뀌면 **항상 `workflow.NODES`·`plan()`·`_RUNNABLE` 을 코드에서 다시 확인하라.** 추측으로 채우지 않았고, 확인 못 한 값은 위 표에 표시했다.
