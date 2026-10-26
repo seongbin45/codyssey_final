@@ -178,6 +178,12 @@ test('여행 입력: 규칙 밖이면 null, 저장·읽기 왕복, 계정 칸마
   assert.equal(AI.cleanTrip({ ...multi, countries: ['미국', '캐나다', '일본', '영국', '독일'] }), null);   // 5개국
   assert.equal(AI.cleanTrip({ ...multi, cities: [{ ...multi.cities[0], ci: 2 }, multi.cities[1]] }), null);   // 없는 나라
   assert.equal(AI.cleanTrip({ ...multi, cities: [multi.cities[0], { ...multi.cities[1], ci: 0 }] }), null);   // 도시 없는 나라
+  // 목록에서 고른 도시의 GeoNames id(gid) 는 지키고, 규칙 밖이면 여행을 버리지 않고 그 칸만 뺀다
+  assert.equal(AI.cleanTrip({ ...good, cities: [{ ...good.cities[0], gid: 5128581 }] }).cities[0].gid, 5128581);
+  for (const bad of [0, -3, 2 ** 31, '5128581', 1.5, null]) {
+    const t = AI.cleanTrip({ ...good, cities: [{ ...good.cities[0], gid: bad }] });
+    assert.ok(t && !('gid' in t.cities[0]), String(bad));
+  }
 
   const mem = new Map();
   const storage = { getItem: k => (mem.has(k) ? mem.get(k) : null), setItem: (k, v) => mem.set(k, String(v)), removeItem: k => mem.delete(k) };
@@ -572,4 +578,117 @@ test('talkSummary: 제한·샘플·폐기·교차검증 실패·heard 없음·�
   const none = AI.talkSummary(turns, {});
   assert.equal(none.spoken, 0); assert.equal(none.fix, null);
   assert.equal(AI.talkSummary(turns, [{ usable: true, score: 10, heard: 'x', fix_one: 'Q' }]).fix, null, '배열 위치로는 붙지 않는다');
+});
+
+test('도시 조사: 요청 본문은 나라·도시·날짜·장소 수만(사용자 정보 없음), gid·ISO2 는 있을 때만', () => {
+  const trip = { countries: ['일본', '아틀란티스'], country: '일본', cities: [
+    { name: '도쿄', start: '2027-03-20', end: '2027-03-23', ci: 0, gid: 1850147 },
+    { name: '어딘가', start: '2027-03-23', end: '2027-03-25', ci: 1, gid: 'x' }] };
+  const body = AI.researchRequestBody(trip, { '도쿄': { attr: 2, rest: 3 } }, n => (n === '일본' ? 'JP' : ''));
+  assert.deepEqual(body.countries, [{ name: '일본', iso2: 'JP' }, { name: '아틀란티스' }]);
+  assert.deepEqual(body.cities[0], { name: '도쿄', ci: 0, start: '2027-03-20', end: '2027-03-23', attr: 2, rest: 3, gid: 1850147 });
+  assert.deepEqual(body.cities[1], { name: '어딘가', ci: 1, start: '2027-03-23', end: '2027-03-25', attr: 0, rest: 0 });
+  assert.ok(!JSON.stringify(body).includes('uid'));
+});
+
+test('도시 조사: 시작 → 폴링 → 완료, 서버 재시작(404)·시간 초과·서버 없음', async () => {
+  const calls = [];
+  const replies = [{ status: 'running', job_id: 'abcdefghijklmnop', progress: [] },
+                   { status: 'running', progress: [{ who: '도쿄', step: 'guide', state: 'done' }] },   // 서버 폴링 응답처럼 job_id 없음
+                   { status: 'done', report: { quality: 'full' } }];
+  const fetchImpl = async (url, opt) => { calls.push([opt.method, url]); const b = replies.shift(); return { ok: true, status: 200, json: async () => b }; };
+  const seen = [];
+  const res = await AI.collectResearch({ fetchImpl, base: '', body: {}, sleep: async () => {}, onProgress: p => seen.push(p.length) });
+  assert.equal(res.status, 'done');
+  assert.deepEqual(calls.map(c => c[0]), ['POST', 'GET', 'GET']);
+  assert.equal(calls[1][1], '/research/abcdefghijklmnop');
+  assert.deepEqual(seen, [0, 1]);
+  const gone = await AI.collectResearch({ fetchImpl: async (u, o) => (o.method === 'POST'
+    ? { ok: true, status: 202, json: async () => ({ status: 'running', job_id: 'abcdefghijklmnop' }) }
+    : { ok: false, status: 404, json: async () => ({}) }), base: '', body: {}, sleep: async () => {} });
+  assert.deepEqual(gone, { status: 'down', reason: 'http_404' });
+  const slow = await AI.collectResearch({ fetchImpl: async () => ({ ok: true, status: 202, json: async () => ({ status: 'running', job_id: 'abcdefghijklmnop' }) }),
+    base: '', body: {}, timeoutMs: 5, sleep: () => new Promise(r => setTimeout(r, 20)) });
+  assert.equal(slow.status, 'timeout');
+  assert.equal((await AI.collectResearch({ fetchImpl, base: null, body: {} })).status, 'down');
+});
+
+test('도시 조사 접기: 종류별 기본 caps + 후보 2, 다시 생성은 2칸 회전, area 는 늘 문자열, 실패면 example', () => {
+  const pl = (i, kind) => ({ id: 'wv:JP_1:' + i, name: 'P' + i, kind, area: i % 2 ? 'Chiyoda' : undefined, desc_en: 'd',
+    sources: [{ url: 'https://en.wikivoyage.org/wiki/Tokyo', title: 'Tokyo' }, { url: 'javascript:x', title: 'bad' }], homepage: 'javascript:alert(1)' });
+  const report = { quality: 'full', countries: { JP: { currency: { code: 'JPY' } } }, attributions: [{ text: 'Wikivoyage' }],
+    cities: [{ idx: 0, iso2: 'JP', status: 'ok', places: [0, 1, 2, 3, 4, 5].map(i => pl(i, 'attraction')).concat([pl(6, 'restaurant'), pl(7, 'cafe')]),
+               practical: [{ topic: 'tipping', text_en: 'No tipping.' }], climate: { kind: 'normals' }, days: [] }] };
+  const cities = [{ name: '도쿄' }];
+  const f = AI.foldResearch(cities, { status: 'done', report }, { '도쿄': { attr: 2, rest: 1 } });
+  assert.equal(f.mode, 'research');
+  const at = f.places.filter(p => p.kind === 'attraction');
+  assert.deepEqual(at.map(p => [p.name, p.selected, p.isCandidate]), [['P0', true, false], ['P1', true, false], ['P2', false, true], ['P3', false, true]]);
+  assert.deepEqual(f.places.filter(p => p.kind !== 'attraction').map(p => [p.name, p.selected]), [['P6', true], ['P7', false]]);
+  assert.ok(f.places.every(p => typeof p.area === 'string' && p.research && p.live));
+  assert.deepEqual(f.places[0].sources, [{ url: 'https://en.wikivoyage.org/wiki/Tokyo', title: 'Wikivoyage · Tokyo' }]);
+  assert.equal(f.places[0].homepage, '');                                         // 위험한 링크는 버린다
+  assert.deepEqual(f.meta['도쿄'], { base: 3, found: 3, mode: 'research', total: 8, stale: false, placeStatus: '' });
+  assert.equal(f.info.cities['도쿄'].practical[0].topic, 'tipping');
+  const again = AI.foldResearch(cities, { status: 'done', report }, { '도쿄': { attr: 2, rest: 1 } }, 1);
+  assert.equal(again.places[0].name, 'P2');                                       // 다시 생성: 2칸 회전
+  assert.equal(AI.foldResearch(cities, { status: 'unavailable', reason: 'research_disabled' }, {}).mode, 'example');
+  assert.equal(AI.foldResearch(cities, { status: 'done', report: { ...report, quality: 'failed' } }, {}).mode, 'example');
+  const none = AI.foldResearch(cities, { status: 'done', report: { ...report, cities: [{ idx: 0, status: 'empty', places: [] }] } }, {});
+  assert.equal(none.mode, 'empty');
+});
+
+test('도시 조사 장소: LLM 추출 한국어 요약·이유·순위가 있으면 싣고, 없거나 이상한 값이면 비운다', () => {
+  const p = AI.researchPlace({ id: 'wv:JP_1:2', name: 'Kitanomaru Park', kind: 'attraction', desc_en: 'Cherry blossoms in spring.',
+    summary_ko: '봄에 벚꽃이 피는 공원이에요.', why_ko: '3월 여행에 맞아요', rank: 1 }, '도쿄', 1);
+  assert.deepEqual([p.desc, p.reason, p.rank, p.descEn], ['봄에 벚꽃이 피는 공원이에요.', '3월 여행에 맞아요', 1, 'Cherry blossoms in spring.']);
+  const q = AI.researchPlace({ id: 'x', name: 'Q', kind: 'attraction', summary_ko: { bad: 1 }, why_ko: 5, rank: '1' }, '도쿄', 2);
+  assert.deepEqual([q.desc, q.reason, q.rank], ['', '', 0]);
+});
+
+test('도시 조사 장소: 대체 소스(Wikidata·Wikipedia·OSM) 출처 이름과 라이선스를 provider 별로', () => {
+  const p = AI.researchPlace({ id: 'wd:JP_1:Q1', name: 'Todai-ji', kind: 'attraction', sources: [
+    { provider: 'wikidata', url: 'https://www.wikidata.org/wiki/Q1', title: 'Todai-ji' },
+    { provider: 'wikipedia', url: 'https://en.wikipedia.org/wiki/Todai-ji', title: 'Todai-ji' }] }, '나라', 1);
+  assert.deepEqual(p.sources.map(s => s.title), ['Wikidata · Todai-ji', 'Wikipedia · Todai-ji']);
+  assert.equal(p.attribution, 'Wikidata (CC0) · Wikipedia (CC BY-SA 4.0)');
+  const o = AI.researchPlace({ id: 'osm:x', name: 'Cafe', kind: 'cafe', sources: [{ provider: 'osm', url: 'https://www.openstreetmap.org/node/1', title: 'Cafe' }] }, '나라', 2);
+  assert.equal(o.attribution, '© OpenStreetMap contributors (ODbL)');
+  const old = AI.researchPlace({ id: 'wv:1', name: 'X', kind: 'attraction', sources: [{ url: 'https://en.wikivoyage.org/wiki/X', title: 'X' }] }, '나라', 3);
+  assert.equal(old.attribution, 'Wikivoyage (CC BY-SA 4.0)');                    // provider 없는 예전 보고서
+});
+
+test('도시 조사 접기: 장소 0곳 도시는 서버가 준 이유(none_reason)·stale, base 는 일정 수 그대로(직접 추가 선택용)', () => {
+  const report = { quality: 'reduced', countries: {}, attributions: [],
+    cities: [{ idx: 0, status: 'ok', place_status: 'thin', stale: true, places: [{ id: 'wd:1', name: 'A', kind: 'attraction', sources: [] }] },
+             { idx: 1, status: 'empty', place_status: 'none', none_reason: 'outage', places: [] },
+             { idx: 2, status: 'partial', places: [] }] };
+  const f = AI.foldResearch([{ name: '도쿄' }, { name: '나라' }, { name: '교토' }], { status: 'done', report },
+    { '도쿄': { attr: 2, rest: 1 }, '나라': { attr: 2, rest: 2 }, '교토': { attr: 1, rest: 1 } });
+  assert.equal(f.mode, 'research');
+  assert.deepEqual([f.meta['도쿄'].stale, f.meta['도쿄'].placeStatus], [true, 'thin']);
+  assert.deepEqual(f.meta['나라'], { base: 4, found: 0, mode: 'empty', stale: false, reason: 'outage' });
+  assert.equal(f.meta['교토'].reason, 'no_places');                                // 예전 보고서(none_reason 없음)
+});
+
+test('도시 조사 접기: 후퇴 표시(merged·parent·wider)만 meta 로 넘기고 모르는 값은 버린다', () => {
+  const mk = fb => ({ quality: 'full', countries: {}, attributions: [],
+    cities: [{ idx: 0, status: 'ok', fallback: fb, places: [{ id: 'a', name: 'A', kind: 'attraction', sources: [] }] }] });
+  const caps = { '군산': { attr: 1, rest: 0 } };
+  assert.deepEqual(AI.foldResearch([{ name: '군산' }], { status: 'done', report: mk({ kind: 'merged', label: 'Gunsan' }) }, caps).meta['군산'].fallback,
+    { kind: 'merged', label: 'Gunsan' });
+  assert.equal(AI.foldResearch([{ name: '군산' }], { status: 'done', report: mk({ kind: 'evil', label: 'x' }) }, caps).meta['군산'].fallback, undefined);
+  assert.equal(AI.foldResearch([{ name: '군산' }], { status: 'done', report: mk(null) }, caps).meta['군산'].fallback, undefined);
+});
+
+test('직접 추가 장소 확인 응답: found 만 링크·이름을 싣고, http·주입·이상한 값은 버린다', () => {
+  const ok = AI.placeCheckResult({ status: 'found', name: ' Tōdai-ji ', distance_km: 2.1,
+    source: { provider: 'wikidata', url: 'https://www.wikidata.org/wiki/Q186148' } });
+  assert.deepEqual([ok.state, ok.name, ok.label, ok.km], ['found', 'Tōdai-ji', 'Wikidata', 2.1]);
+  assert.equal(AI.placeCheckResult({ status: 'not_found' }).state, 'not_found');
+  assert.equal(AI.placeCheckResult({ status: 'no_city' }).state, 'not_found');
+  assert.equal(AI.placeCheckResult({ status: 'found', name: 'X', source: { url: 'http://evil' } }).state, 'error');
+  assert.equal(AI.placeCheckResult({ status: 'found', name: '<b>', source: { url: 'https://a.b' } }).state, 'error');
+  assert.equal(AI.placeCheckResult(null).state, 'error');
+  assert.equal(AI.placeCheckResult({ status: 'found', name: 'G', source: { provider: 'google', url: 'https://maps.google.com/?cid=1' } }).label, 'Google 지도');
 });

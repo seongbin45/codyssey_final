@@ -623,7 +623,8 @@ function createTrip(d) {
 function tripInputOf(t) {
   const countries = (Array.isArray(t.countries) && t.countries.length ? t.countries : [t.country || '']).slice();
   return draftSync({ countries, country: countries[0],
-    cities: t.cities.map(c => ({ name: c.name, start: c.start, end: c.end, ci: Math.min(+c.ci || 0, Math.max(0, countries.length - 1)) })),
+    cities: t.cities.map(c => ({ name: c.name, start: c.start, end: c.end, ci: Math.min(+c.ci || 0, Math.max(0, countries.length - 1)),
+      ...(Number.isInteger(c.gid) ? { gid: c.gid } : {}) })),
     studyStart: t.studyStart });
 }
 function tripFromInput(d, id) {
@@ -667,7 +668,9 @@ function applyTripDates(d) {
 /* 도시 이름 목록(순서 포함)이 같은가. 같으면 장소·문장을 다시 만들 필요가 없다(날짜만 다시 계산). */
 function sameTripCities(a, b) {
   if (a.length !== b.length) return false;
-  return a.every((c, i) => String(c.name || '').trim() === b[i].name);
+  // 이름이 같아도 둘 다 GeoNames id 가 있는데 다르면 다른 도시다(같은 이름의 다른 곳). 한쪽만 있으면 이름으로 본다.
+  return a.every((c, i) => String(c.name || '').trim() === b[i].name
+    && !(Number.isInteger(c.gid) && Number.isInteger(b[i].gid) && c.gid !== b[i].gid));
 }
 /* 날짜만 바꿀 때 만들어질 일정표의 날짜 집합. 완료한 날이 일정에서 빠지는지 저장 전에 확인하는 데 쓴다.
    buildPlan 의 일정 구성과 같은 규칙(여행 전 날짜 + studyStart 이후의 여행 날짜)을 따른다. */
@@ -843,6 +846,7 @@ function request(stage, byUser = true) {
   S.gen = { stage, step: 0, steps: stepsFor(stage), stuck: false };
   S.screen = 'u-gen'; render();
   cancelGen(); const tok = genToken;
+  if (stage === 'report') researchRun = startResearch(tok);   // 진행 단계를 보여 주는 동안 실제 조사를 돌린다
   genTimer = setTimeout(() => {
     if (tok !== genToken || t.status !== stage + '_requested') return;
     t.status = stage + '_generating'; t.genStartedAt = Date.now();
@@ -930,12 +934,50 @@ function failStage(stage) {
 }
 /* 보고서 요청만 /itinerary 를 부른다. 메뉴로 연 화면(ensure)은 예시 데이터를 유지한다.
    플래그가 꺼졌거나 모든 도시가 실패하면 genReport 로 돌아간다. */
+/* 도시 조사(backend/app/research): 사용자가 고른 나라·도시를 여행 날짜·체류에 맞게 실제 소스에서 조사한다.
+   서버가 꺼져 있거나(research_disabled) 실패하면 아래 /itinerary → 예시 경로로 그대로 돌아간다(섞지 않는다). */
+let researchAbort = null, researchRun = null;
+const RESEARCH_STEP_KO = { guide: '여행 가이드(위키보이지) 읽는 중', climate: '여행 날짜 날씨 확인 중', country: '나라 정보(통화·긴급번호·여행 권고) 확인 중' };
+function researchCaps(cities) {
+  const base = R.cityBase(R.buildDays(cities)), caps = {};
+  cities.forEach(c => { const b = base[c.name]; caps[c.name] = { attr: b ? b.attr : 0, rest: b ? b.rest : 0 }; });
+  return caps;
+}
+async function startResearch(tok) {
+  if (researchAbort) researchAbort.abort();
+  const ctl = researchAbort = new AbortController();
+  if (API.base === null || !S.trip) return { status: 'down', reason: 'no_server' };
+  try { await geoCountries(); } catch (e) { /* 나라 목록이 없으면 이름만 보낸다 */ }
+  const t = S.trip;
+  const body = AI.researchRequestBody(t, researchCaps(t.cities), n => (countryByName(n) || {}).iso2 || '');
+  return AI.collectResearch({
+    fetchImpl: (u, o) => fetch(u, o), base: API.base, body, signal: ctl.signal,
+    onProgress: evs => {
+      if (tok !== genToken || !S.gen || !evs.length) return;
+      const last = evs[evs.length - 1], done = evs.filter(e => e.state === 'done').length;
+      S.gen.waitNote = `실제 자료를 조사하고 있어요 · ${last.who || ''} ${RESEARCH_STEP_KO[last.step] || ''} (${done}단계 끝)`;
+      if (S.screen === 'u-gen') render();
+    },
+  });
+}
 async function runReport(tok) {
   S.reportMode = 'example';
   S.itineraryBlocks = null;
   S.reportPlaces = null;
   S.reportMetaLive = null;
+  S.research = null;
   if (API.base === null || !S.trip) return;
+  try {
+    const res = await (researchRun || startResearch(tok));
+    researchRun = null;
+    if (tok !== genToken) return;
+    const folded = AI.foldResearch(S.trip.cities, res, researchCaps(S.trip.cities), S.trip.reportRound);
+    if (folded.mode !== 'example') {
+      S.reportMode = folded.mode === 'research' ? 'research' : 'empty';
+      S.reportPlaces = folded.places; S.reportMetaLive = folded.meta; S.research = folded.info;
+      return;
+    }
+  } catch (e) { if (tok !== genToken) return; }
   if (genAbort) genAbort.abort();
   const ctl = genAbort = new AbortController();
   const caps = {};
@@ -970,7 +1012,8 @@ function succeed(stage) {
     S.cityTab = t.cities[0].name; S.showCand = {};
     S.screen = 'u-report'; render();
     const again = t.reportRound > 1 ? `보고서를 다시 만들었어요. 남은 다시 생성 ${3 - t.regenerateCount}번` : '보고서가 준비됐어요. 가지 않을 장소를 빼 주세요.';
-    toast(S.reportMode === 'empty' ? '확인된 장소가 없어요.' : S.reportMode === 'live' ? '확인한 장소를 골랐어요. 가지 않을 장소를 빼 주세요.' : again);
+    toast(S.reportMode === 'empty' ? '확인된 장소가 없어요.' : S.reportMode === 'live' ? '확인한 장소를 골랐어요. 가지 않을 장소를 빼 주세요.'
+      : S.reportMode === 'research' ? '여행 가이드에서 조사한 장소예요. 가지 않을 장소를 빼 주세요.' : again);
   } else if (stage === 'route') {
     if (S.itineraryBlocks) {
       S.days = AI.placeBlocksOnDays(R.buildDays(t.cities), S.places, t.cities, S.itineraryBlocks);
@@ -2388,27 +2431,101 @@ function geoClose(onlyKey) {
   GEO.open = null;
   geoHideList(document.querySelector(`[data-geo="${CSS.escape(o.key)}"]`));
 }
-function geoRender(el, items, note) {
+/* 목록 한 번에 그리는 줄 수. 넘으면 '더 보기'로 이어 붙인다 —
+   잘라 버리면 '생략된 목록'이 되고, 한꺼번에 다 그리면 폰이 버벅인다. */
+const GEO_PAGE = 80;
+function geoUnit(key) { return /^country/.test(key) ? '개국' : '곳'; }
+function geoOpts(el, items, from, to) {
+  const isCountry = /^country/.test(geoKey(el)), ul = geoListEl(el);
+  return items.slice(from, to).map((it, j) => {
+    const i = from + j;
+    return isCountry
+      ? `<li role="option" id="${ul.id}-o${i}" class="geo-opt" data-geo-i="${i}" aria-selected="false"><b>${esc(it.ko || it.name)}</b><small>${esc(it.name)}</small></li>`
+      : `<li role="option" id="${ul.id}-o${i}" class="geo-opt" data-geo-i="${i}" aria-selected="false"><b>${esc(it.label)}</b><small>${esc([it.label !== it.name ? it.name : '', it.region, it.population >= 10000 ? `인구 ${fmtPop(it.population)}` : ''].filter(Boolean).join(' · '))}</small></li>`;
+  }).join('');
+}
+/* 목록 아래 '더 보기'·'전체 N 중 M 표시' 두 줄. M 은 지금 그려진 줄, 남은 수는 서버에 남은 쪽까지 센다. */
+function geoFoot(key, o) {
+  const u = geoUnit(key), left = Math.max(0, o.total - o.shown);
+  const more = left > 0 ? `<button type="button" data-act="geo-more" data-geo-key="${esc(key)}"${o.loadingMore ? ' disabled' : ''}>${o.loadingMore ? '불러오는 중…' : `＋ 나머지 ${left.toLocaleString('ko-KR')}${u} 더 보기`}</button>` : '';
+  return { more, count: `전체 ${o.total.toLocaleString('ko-KR')}${u} 중 ${o.shown.toLocaleString('ko-KR')}${u} 표시` };
+}
+function geoRender(el, items, note, total, extra = {}) {
   const ul = geoListEl(el); if (!ul) return;
   const key = geoKey(el), isCountry = /^country/.test(key);
   /* 목록은 한 번에 하나만 열린다. GEO.open 은 칸 하나짜리 상태라, 도시 목록을 열면서 나라 목록을
      그대로 두면 나라 쪽은 주인을 잃어 닫히지 않는다 → 두 목록이 동시에 떠 있고, Esc·바깥 탭은
      도시만 닫아 나라 목록이 유령으로 남는다. 열기 전에 다른 칸의 목록을 먼저 접는다. */
   document.querySelectorAll('[data-geo][aria-expanded="true"]').forEach(other => { if (other !== el) geoHideList(other); });
-  GEO.open = { key, items, active: -1 };
-  const opts = items.map((it, i) => isCountry
-    ? `<li role="option" id="${ul.id}-o${i}" class="geo-opt" data-geo-i="${i}" aria-selected="false"><b>${esc(it.ko || it.name)}</b><small>${esc(it.name)}</small></li>`
-    : `<li role="option" id="${ul.id}-o${i}" class="geo-opt" data-geo-i="${i}" aria-selected="false"><b>${esc(it.label)}</b><small>${esc([it.label !== it.name ? it.name : '', it.region, it.population >= 10000 ? `인구 ${fmtPop(it.population)}` : ''].filter(Boolean).join(' · '))}</small></li>`).join('');
-  ul.innerHTML = (opts || '') + (note ? `<li class="geo-note" role="presentation">${note}</li>` : '')
-    + (items.length ? `<li class="geo-note geo-src" role="presentation">출처: GeoNames (CC BY 4.0)</li>` : '');
+  /* 지금 칸에 적힌 값이 목록에 있으면 그 줄까지 그려 두고 표시한다(목록을 열면 고른 곳이 보이게). */
+  const cur = extra.current ? items.findIndex(it => geoNorm(isCountry ? (it.ko || it.name) : it.label) === geoNorm(extra.current)) : -1;
+  const shown = Math.min(items.length, Math.max(GEO_PAGE, cur >= 0 ? Math.ceil((cur + 1) / GEO_PAGE) * GEO_PAGE : 0));
+  GEO.open = { key, items, active: cur, shown, total: Math.max(total == null ? items.length : total, items.length),
+    browse: !!extra.browse, iso2: extra.iso2 || null, loadingMore: false };
+  const opts = geoOpts(el, items, 0, shown);
+  /* '생략 없음'을 화면이 스스로 말한다: 전체 개수를 늘 적고, 남은 줄은 '더 보기'로 이어진다. */
+  const foot = geoFoot(key, GEO.open);
+  ul.innerHTML = (opts || '') + (foot.more ? `<li class="geo-note geo-more" role="presentation">${foot.more}</li>` : '')
+    + (note ? `<li class="geo-note" role="presentation">${note}</li>` : '')
+    + (items.length ? `<li class="geo-note geo-count" role="presentation">${foot.count}</li>
+      <li class="geo-note geo-src" role="presentation">출처: GeoNames (CC BY 4.0)</li>` : '');
   const show = !!(opts || note);
   ul.hidden = !show;
   el.setAttribute('aria-expanded', show ? 'true' : 'false');
+  if (show && cur >= 0) {
+    const li = ul.querySelector(`[data-geo-i="${cur}"]`);
+    if (li) { li.setAttribute('aria-selected', 'true'); el.setAttribute('aria-activedescendant', li.id); ul.scrollTop = Math.max(0, li.offsetTop - 8); }
+  }
+}
+/* '더 보기': 다음 묶음을 뒤에 붙인다. 앞의 스크롤 위치·이미 고른 줄은 그대로 둔다. */
+async function geoMore(key) {
+  const o = GEO.open; if (!o || o.key !== key || o.loadingMore) return;
+  const el = document.querySelector(`[data-geo="${CSS.escape(key)}"]`), ul = el && geoListEl(el);
+  if (!ul) return;
+  /* 단추 자리를 다시 그리면 포커스가 있던 단추가 사라져 포커스가 body 로 떨어지고, 그러면 '바깥으로 나갔다'고
+     보고 목록이 닫힌다. 다시 그리기 전에 포커스를 칸으로 돌려 둔다. */
+  if (ul.contains(document.activeElement)) el.focus({ preventScroll: true });
+  const paint = () => {
+    const more = ul.querySelector('.geo-more'), count = ul.querySelector('.geo-count'), foot = geoFoot(key, o);
+    if (more) { if (foot.more) more.innerHTML = foot.more; else more.remove(); }
+    if (count) count.textContent = foot.count;
+  };
+  if (o.shown >= o.items.length && o.items.length < o.total && o.browse && o.iso2) {
+    /* 빈 칸 도시 목록: 받아 둔 줄을 다 그렸으면 서버에서 다음 쪽을 받아 이어 붙인다 — 끝까지 닿는다. */
+    o.loadingMore = true; paint();
+    const page = await geoCityPage(o.iso2, '', o.items.length);
+    o.loadingMore = false;
+    if (GEO.open !== o) return;                                   // 그사이 목록이 닫히거나 바뀌었다
+    if (!page.items.length) { o.total = o.items.length; paint(); return; }
+    o.items.push(...page.items); o.total = Math.max(page.total, o.items.length);
+  }
+  const from = o.shown, to = Math.min(from + GEO_PAGE, o.items.length);
+  o.shown = to;
+  const more = ul.querySelector('.geo-more');
+  if (more) more.insertAdjacentHTML('beforebegin', geoOpts(el, o.items, from, to));
+  paint();
+}
+/* 도시 한 쪽. 빈 칸(q 없음)은 인구순 전체를 offset 부터, 검색은 맞는 것 전부(서버 상한 안). 같은 쪽은 다시 받지 않는다. */
+const GEO_CITY_PAGE = 500;
+async function geoCityPage(iso2, q, offset) {
+  const ck = iso2 + '|' + geoNorm(q) + '|' + offset;
+  const hit = GEO.cities.get(ck);
+  if (hit) return { items: hit.items.slice(), total: hit.total };
+  let items = [], total = 0;
+  try {
+    const r = await fetch(`${API.base}/geo/cities?country=${iso2}&limit=${q ? 2000 : GEO_CITY_PAGE}&offset=${offset}&q=${encodeURIComponent(q)}`);
+    const body = r.ok ? await r.json() : null;
+    items = (body && body.cities) || [];
+    total = (body && body.total) || items.length;
+  } catch (e) { items = []; total = 0; }
+  if (GEO.cities.size > 200) { const first = GEO.cities.keys().next().value; if (first !== ck) GEO.cities.delete(first); }
+  GEO.cities.set(ck, { items, total });
+  return { items: items.slice(), total };
 }
 function fmtPop(n) { return n >= 10000 ? `${Math.round(n / 10000).toLocaleString('ko-KR')}만` : n.toLocaleString('ko-KR'); }
 function geoMove(el, d) {
-  const o = GEO.open; if (!o || !o.items.length) return;
-  o.active = (o.active + d + o.items.length) % o.items.length;
+  const o = GEO.open; if (!o || !o.shown) return;
+  o.active = (o.active + d + o.shown) % o.shown;          // 그려진 줄 안에서만 움직인다
   const ul = geoListEl(el);
   ul.querySelectorAll('.geo-opt').forEach((li, i) => li.setAttribute('aria-selected', i === o.active ? 'true' : 'false'));
   const cur = ul.querySelector(`[data-geo-i="${o.active}"]`);
@@ -2420,19 +2537,31 @@ function geoPick(el, i) {
   const value = isCountry ? (it.ko || it.name) : it.label;
   el.value = value;
   if (isCountry) { S.draft.countries[+(key.split('.')[1] || 0)] = value; draftSync(S.draft); }
-  else S.draft.cities[+key.split('.')[1]].name = value;
+  else {
+    const c = S.draft.cities[+key.split('.')[1]];
+    c.name = value;
+    if (Number.isInteger(it.id) && it.id > 0) c.gid = it.id; else delete c.gid;   // 목록의 그 도시(GeoNames id) — 조사 단계가 이름 대신 쓴다
+  }
   geoClose();
   updateInputLive();
 }
-async function geoQuery(el) {
-  const key = geoKey(el), q = el.value.trim(), seq = ++GEO.seq;
+/* browse = 칸을 눌러(또는 ↓) 목록만 연 것. 이미 적힌 값(고른 나라·저장된 여행)으로 거르지 않고
+   생략 없는 전체 목록을 보여 주며, 적힌 값은 목록 안에서 표시만 한다. 사용자가 글자를 치면(input) 그때부터 거른다.
+   (예전에는 칸에 '미국'이 들어 있으면 열자마자 '미국'으로 걸러 3개만 보였다 — 아무것도 안 쳤는데 전체가 안 나왔다.) */
+async function geoQuery(el, opt = {}) {
+  const key = geoKey(el), browse = !!opt.browse, q = browse ? '' : el.value.trim(), seq = ++GEO.seq;
+  const current = el.value.trim();
   const countries = await geoCountries();
   if (seq !== GEO.seq || document.activeElement !== el) return;
   if (!countries) { geoClose(); return; }                       // 목록을 못 받으면 글자 입력만
   if (/^country/.test(key)) {
     const k = geoNorm(q);
-    const items = (k ? countries.filter(c => c._k.some(x => x.startsWith(k))).concat(countries.filter(c => !c._k.some(x => x.startsWith(k)) && c._k.some(x => x.includes(k)))) : countries).slice(0, 60);
-    geoRender(el, items, items.length ? '' : '목록에 없어요 — 적은 그대로 써도 돼요.');
+    /* 빈 칸이면 '생략 없는 전체 목록'을 준다. 예전에는 slice(0, 60) 으로 248개국 중 60개만
+       말없이 잘라 보여 줬고, 그래서 아무것도 입력하지 않았을 때 목록이 덜 찬 것처럼 보였다. */
+    const items = k
+      ? countries.filter(c => c._k.some(x => x.startsWith(k))).concat(countries.filter(c => !c._k.some(x => x.startsWith(k)) && c._k.some(x => x.includes(k))))
+      : countries;
+    geoRender(el, items, items.length ? '' : '목록에 없어요 — 적은 그대로 써도 돼요.', items.length, { browse, current });
     return;
   }
   /* 도시 칸의 국가는 '그 도시가 속한 국가'(ci)다 — 국가가 여럿이면 칸마다 다르다. */
@@ -2440,18 +2569,11 @@ async function geoQuery(el) {
   const ctryName = String((S.draft.countries || [])[ci] || '');
   const c = countryByName(ctryName);
   if (!c) { geoRender(el, [], ctryName.trim() ? '국가를 목록에서 고르면 도시 목록이 나와요.' : '국가를 먼저 고르세요.'); return; }
-  const ck = c.iso2 + '|' + geoNorm(q);
-  let items = GEO.cities.get(ck);
-  if (!items) {
-    try {
-      const r = await fetch(`${API.base}/geo/cities?country=${c.iso2}&limit=20&q=${encodeURIComponent(q)}`);
-      items = r.ok ? (await r.json()).cities || [] : [];
-    } catch (e) { items = []; }
-    if (GEO.cities.size > 200) GEO.cities.clear();
-    GEO.cities.set(ck, items);
-  }
+  /* 빈 칸이면 서버가 그 나라 전체(모든 샤드)를 쪽으로 준다 — total 은 그 나라 전부. '더 보기'가 다음 쪽을 받는다. */
+  const { items, total } = await geoCityPage(c.iso2, q, 0);
   if (seq !== GEO.seq || document.activeElement !== el) return;
-  geoRender(el, items, items.length ? '' : (q ? '목록에 없어요 — 적은 그대로 써도 돼요.' : ''));
+  geoRender(el, items, items.length ? '' : (q ? '목록에 없어요 — 적은 그대로 써도 돼요.' : ''), total,
+    { browse: !q, iso2: c.iso2, current: browse ? current : '' });
 }
 function geoQueryLater(el) {
   clearTimeout(GEO.timer);
@@ -2461,17 +2583,33 @@ document.addEventListener('focusin', e => {
   const el = e.target;
   if (!el.dataset || !el.dataset.geo) return;
   if (GEO.open && GEO.open.key === el.dataset.geo) return;   // 목록을 만지다 칸으로 돌아온 것 — 다시 그리면 스크롤 위치가 날아간다
-  geoQuery(el);
+  // 칸을 누르면 전체 목록(적힌 값으로 거르지 않음). 적힌 값은 선택해 두어 바로 치면 바꿔 쓰게 한다.
+  if (el.value) { try { el.select(); } catch (err) { /* 선택 미지원 */ } }
+  geoQuery(el, { browse: true });
 });
 document.addEventListener('focusout', e => {
   const el = e.target;
-  if (el.dataset && el.dataset.geo) setTimeout(() => { if (document.activeElement !== el && !GEO.keep) geoClose(el.dataset.geo); }, 120);
+  if (!el.dataset || !el.dataset.geo) return;
+  setTimeout(() => {
+    const ul = geoListEl(el), a = document.activeElement;
+    if (a === el || GEO.keep || (ul && a && ul.contains(a))) return;   // 목록 안('더 보기' 단추)으로 간 포커스는 닫을 이유가 아니다
+    geoClose(el.dataset.geo);
+  }, 120);
+});
+document.addEventListener('focusout', e => {      // 포커스가 목록 안에 있다가 바깥으로 나가면 닫는다
+  const ul = e.target.closest && e.target.closest('.geo-list');
+  if (!ul) return;
+  setTimeout(() => {
+    const el = document.querySelector(`[aria-controls="${ul.id}"]`), a = document.activeElement;
+    if (!el || a === el || GEO.keep || (a && ul.contains(a))) return;
+    geoClose(el.dataset.geo);
+  }, 120);
 });
 document.addEventListener('keydown', e => {
   const el = e.target;
   if (!el.dataset || !el.dataset.geo) return;
   if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
-    if (!GEO.open || GEO.open.key !== el.dataset.geo) { geoQuery(el); return; }   // 다른 칸의 목록을 움직이지 않는다
+    if (!GEO.open || GEO.open.key !== el.dataset.geo) { geoQuery(el, { browse: true }); return; }   // 다른 칸의 목록을 움직이지 않는다
     e.preventDefault(); geoMove(el, e.key === 'ArrowDown' ? 1 : -1);
   } else if (e.key === 'Enter' && GEO.open && GEO.open.active >= 0) {
     e.preventDefault(); geoPick(el, GEO.open.active);
@@ -2488,6 +2626,9 @@ document.addEventListener('pointerdown', e => {
   if (!ul) return;
   GEO.keep = ul.id;
   if (e.pointerType === 'mouse' && e.target.closest('.geo-opt')) e.preventDefault();
+  /* '더 보기' 단추는 손가락·마우스 모두 포커스를 칸에 남긴다. 터치는 pointerup 뒤에야 포커스가 단추로 옮겨 가서,
+     그때는 GEO.keep 이 이미 풀려 칸의 focusout 이 목록을 닫았다(단추를 누르면 목록이 닫히던 원인). click 은 그대로 난다. */
+  if (e.target.closest('.geo-more')) e.preventDefault();
 });
 function geoRelease() {
   if (!GEO.keep) return;
@@ -2565,6 +2706,13 @@ function scrReport() {
   if (S.reportMode === 'example') {
     lead += notice('이 장소 목록은 <b>미리 준비한 예시 데이터</b>예요. (AI 웹 검색은 아직 연결 전이에요) 영업시간과 메뉴는 바뀔 수 있으니 방문 전에 확인해 주세요.');
     if (meta.found < meta.base) lead += notice(`추천할 장소를 충분히 찾지 못했어요. 기본 ${meta.base}곳 중 ${meta.found}곳만 찾았어요. 후보로 채울 수 있어요.`, 'warn');
+  } else if (meta.mode === 'research') {
+    lead += notice(`공개 여행 자료(위키보이지·위키데이터 등)에서 <b>실제로 조사한 장소</b>예요 — 이 도시 ${meta.total}곳 중 여행 일정에 맞춰 골랐어요. 영업시간·가격은 방문 전에 확인해 주세요.`);
+    if (meta.stale) lead += notice('자료 서버가 지금 응답하지 않아 <b>지난번에 조사한 장소</b>를 보여 드려요.', 'warn');
+    if (meta.fallback) lead += notice(fallbackNotice(city, meta.fallback), 'warn');
+  } else if (S.research) {
+    // 조사는 됐지만 이 도시만 장소 0곳 — 예시로 채우지 않고, 이유를 알리고 도시 브리프·직접 추가를 보인다
+    lead += notice(PLACE_NONE_KO[meta.reason] || PLACE_NONE_KO.no_sources, 'warn');
   } else if (meta.mode === 'live') {
     lead += notice('Google Maps에서 확인한 장소예요. 한국어 설명, 메뉴, 영업시간, 평점, 가격은 없어요.');
     const failed = (meta.queries || []).filter(q => q && q.status && q.status !== 'verified');
@@ -2579,9 +2727,14 @@ function scrReport() {
     <div class="stack" style="margin-bottom:14px">
       ${lead}
     </div>
+    ${S.research ? researchInfo(city) : briefCard(city)}
+    ${S.research && meta.mode === 'empty' ? briefCard(city) : ''}
+    ${S.research && meta.mode === 'empty' && meta.reason === 'outage' && !locked ? `<button class="btn soft block" data-act="research-retry">다시 조사하기</button>` : ''}
     <div class="city-head"><h3>${esc(city)}</h3><span class="cnt"><b>${sel}</b> / 최대 ${meta.base}곳</span></div>
     ${base.map(p => placeCard(p, locked)).join('')}
     ${cands.length ? `<button class="cand-toggle" data-act="cand" data-city="${esc(city)}">${open ? '후보 접기' : `후보 더 보기 (${cands.length})`}</button>${open ? cands.map(p => placeCard(p, locked)).join('') : ''}` : ''}
+    ${S.research && meta.mode === 'empty' && !locked ? addPlaceForm(city) : ''}
+    ${researchCredits()}
   </div>`;
   const left = 3 - t.regenerateCount;
   const bottom = locked ? `<button class="btn primary block" data-act="tab" data-id="${t.status === 'studying' ? 'u-route' : 'u-gen'}">${t.status === 'studying' ? '방문 순서 보기' : '진행 상황 보기'}</button>`
@@ -2590,7 +2743,158 @@ function scrReport() {
        <div class="small" style="text-align:center">다시 생성은 성공한 경우에만 횟수가 줄어요 · 남은 횟수 ${left}번</div>`;
   return frame(inner, { appbar: appbar('보고서 · 장소 선택', { step: 'STEP 2/3' }), bottom });
 }
+/* 조사한 도시의 '현지 정보' — 여행 날짜 날씨·통화·긴급번호·전기·여행 권고, 도착/이동/출국일에 필요한 교통 정보.
+   한국어 요약이 있으면(LLM 추출이 검증을 통과한 것만) 요약 + 그 근거인 영어 원문 인용을, 없으면 영어 원문 발췌를 보인다.
+   줄마다 출처로 이어진다. */
+const RESEARCH_TOPIC_KO = { transport_airport: '공항·도착', transport_local: '시내 교통', etiquette: '예절', safety: '안전',
+  health: '건강', language: '언어', connect: '통신·인터넷', cope: '생활 팁', tipping: '팁' };
+const RESEARCH_ROLE_KO = { arrival: '도착일', departure: '출국일', transfer_out: '이동일(떠남)', transfer_in: '이동일(도착)' };
+function researchInfo(city) {
+  const inf = S.research && S.research.cities[city];
+  if (!inf) return '';
+  const co = inf.iso2 && S.research.countries[inf.iso2];
+  const link = (url, label) => url && /^https:\/\//.test(url) ? ` <a href="${esc(url)}" data-act="link" rel="noopener noreferrer">${esc(label)}</a>` : '';
+  const rows = [];
+  const c = inf.climate;
+  if (c) rows.push(`<li><b>날씨</b> ${c.kind === 'forecast' ? '예보' : '평년값(최근 5년 같은 날짜)'} · 최고 ${esc(String(c.tmax_avg))}° / 최저 ${esc(String(c.tmin_avg))}° · 비 온 날 ${esc(String(c.wet_days_pct))}% <span class="small">${esc(c.window || '')}</span></li>`);
+  if (co) {
+    if (co.currency && co.currency.code) rows.push(`<li><b>통화</b> ${esc(co.currency.code)}${co.currency.krw_per_unit ? ` · 1${esc(co.currency.code)} ≈ ${esc(Number(co.currency.krw_per_unit).toLocaleString('ko-KR'))}원 <span class="small">기준일 ${esc(co.currency.as_of || '')}</span>` : ''}</li>`);
+    if ((co.emergency || []).length) rows.push(`<li><b>긴급 전화</b> ${co.emergency.map(esc).join(' · ')}</li>`);
+    if ((co.plugs || []).length || co.voltage) rows.push(`<li><b>전기</b> ${esc((co.plugs || []).join(', '))}${co.voltage ? ` · ${esc(co.voltage)}V` : ''}</li>`);
+    if (co.driving_side) rows.push(`<li><b>차량 통행</b> ${co.driving_side === 'left' ? '좌측' : co.driving_side === 'right' ? '우측' : esc(co.driving_side)}</li>`);
+    if ((co.languages || []).length) rows.push(`<li><b>공용어</b> ${co.languages.map(esc).join(', ')}</li>`);
+    // 안전 정보: 한국인 기준 출처(외교부 해외안전여행 API)가 붙기 전까지 본문을 싣지 않고 그 사이트로만 안내한다
+    rows.push(`<li><b>안전 정보</b> <span class="small">아직 조사하지 않아요</span>${link('https://www.0404.go.kr/', '외교부 해외안전여행에서 확인')}</li>`);
+  }
+  const roles = (inf.days || []).filter(d => RESEARCH_ROLE_KO[d.role]);
+  const tips = roles.length ? `<div class="small rinfo-days">${roles.map(d => `${esc(RESEARCH_ROLE_KO[d.role])} ${esc(Dt.md(d.date))}${d.topics && d.topics.length ? ` — ${d.topics.map(t => esc(RESEARCH_TOPIC_KO[t] || t)).join('·')} 정보를 먼저 보세요` : ''}`).join('<br>')}</div>` : '';
+  const practical = (inf.practical || []).map(p => `<details class="rinfo-topic"><summary>${esc(RESEARCH_TOPIC_KO[p.topic] || p.topic)}</summary>
+      ${p.summary_ko && p.quote_en ? `<p>${esc(p.summary_ko)}</p><blockquote class="rinfo-quote" lang="en">${esc(p.quote_en)}</blockquote>`
+        : `<p lang="en">${esc(p.text_en || '')}</p>`}${p.source ? `<div class="small">${link(p.source.url, '원문 · Wikivoyage')}</div>` : ''}</details>`).join('');
+  if (!rows.length && !practical) return '';
+  return `<details class="card rinfo" open><summary><b>${esc(city)} 현지 정보</b> <span class="small">여행 날짜에 맞춰 조사했어요</span></summary>
+    ${rows.length ? `<ul class="rinfo-rows">${rows.join('')}</ul>` : ''}${tips}${practical}</details>`;
+}
+/* 백업(롤백) 경로: 조사 파이프라인(/research)이 꺼져 있거나 실패한 보고서에서는 도시 브리프(GET /city-brief —
+   위키백과 한/영·위키여행·위키데이터 교차검증, LLM 없음)로 '이 도시 알아두기'를 보여 준다(다른 에이전트 작업에서 들여옴).
+   카드는 받은 문단을 그대로 그린다 — 여기서 문장을 만들지 않는다. 자료가 없으면 '없음'으로 적는다(빈 카드로 성공한 척하지 않는다). */
+const BRIEF = { cache: new Map() };
+const BRIEF_KIND = { overview: '도시 소개', understand: '이해', get_in: '가는 법', see: '볼거리', eat: '먹을 것',
+  stay_safe: '주의', facts: '숫자', brief: '한눈에' };
+function briefCtx(cityName) {
+  const t = S.trip, c = t && t.cities.find(x => x.name === cityName);
+  const list = t ? (Array.isArray(t.countries) && t.countries.length ? t.countries : [t.country || '']) : [];
+  const country = c ? String(list[Math.min(+c.ci || 0, Math.max(0, list.length - 1))] || '') : '';
+  return { city: String(cityName || '').trim(), country: country.trim(), key: (cityName + '|' + country).toLowerCase() };
+}
+async function briefLoad(cityName, force) {
+  const { city, country, key } = briefCtx(cityName);
+  if (!city || API.base === null || (!force && BRIEF.cache.has(key))) return;
+  BRIEF.cache.set(key, { state: 'loading' });
+  try {
+    const r = await fetch(`${API.base}/city-brief?country=${encodeURIComponent(country)}&city=${encodeURIComponent(city)}&lang=ko`);
+    BRIEF.cache.set(key, r.ok ? { state: 'ok', data: await r.json() } : { state: 'error' });
+  } catch (e) { BRIEF.cache.set(key, { state: 'error' }); }
+  if (S.screen === 'u-report') render();
+}
+function briefCard(cityName) {
+  if (API.base === null) return '';
+  const { city, key } = briefCtx(cityName);
+  const st = BRIEF.cache.get(key);
+  if (!st) { setTimeout(() => briefLoad(cityName), 0); }
+  if (!st || st.state === 'loading') {
+    return `<div class="card brief-card loading" role="status" aria-live="polite"><div class="brief-h"><b>${esc(city)} 알아보는 중</b><span class="brief-tag">조사 중</span></div>
+      <div class="brief-sk"></div><div class="brief-sk w2"></div></div>`;
+  }
+  const d = st.data;
+  if (st.state === 'error' || !d || !d.ok) {
+    if (d && d.reason === 'city_brief_disabled') return '';
+    const why = st.state === 'error' ? '연결이 안 됐어요' : '출처를 찾지 못했어요';
+    return `<div class="card brief-card none"><div class="brief-h"><b>${esc(city)} 자료</b><span class="brief-tag none">없음</span>
+      <button type="button" class="brief-retry" data-act="brief-retry" data-city="${esc(cityName)}">다시 조사</button></div>
+      <p class="brief-none">${why}.</p></div>`;
+  }
+  const conf = d.confidence === 'verified' ? '출처 확인' : d.confidence === 'single_source' ? '출처 1곳' : '일부만 확인';
+  const rows = (d.sections || []).map(x => `<div class="brief-row"><span class="brief-k">${esc(BRIEF_KIND[x.kind] || x.kind)}</span>
+      <p class="brief-t">${esc(x.text)}</p>${x.url && /^https:\/\//.test(x.url) ? `<a class="brief-src" href="${esc(x.url)}" data-act="link" rel="noopener noreferrer">출처</a>` : ''}</div>`).join('');
+  const gaps = (d.gaps || []).length ? `<p class="brief-gap">확인하지 못한 것: ${esc(d.gaps.join(' · '))}</p>` : '';
+  return `<div class="card brief-card"><div class="brief-h"><b>${esc(city)} 알아두기</b><span class="brief-tag">${conf}</span>
+      <button type="button" class="brief-retry" data-act="brief-retry" data-city="${esc(cityName)}" title="다시 조사" aria-label="다시 조사">↻</button></div>
+    ${rows}${gaps}<p class="brief-attr">${esc(d.attribution || '')}</p></div>`;
+}
+/* 후퇴(복구)로 찾은 장소 안내: 옛 지명 → 지금 도시, 상위 구역 기준, 반경을 넓혀 찾음 */
+function fallbackNotice(city, fb) {
+  const label = fb.label ? `'${esc(fb.label)}'` : '';
+  if (fb.kind === 'merged') return `${esc(josa(city, '은', '는'))} 지금은 ${label || '다른 도시'}${label ? '(으)로' : '로'} 통합된 지명이라, 그 도시 기준으로 조사했어요.`;
+  if (fb.kind === 'parent') return `${esc(city)}의 정확한 위치를 찾지 못해 상위 지역 ${label} 기준으로 조사했어요. 실제 위치와 떨어진 장소가 섞일 수 있어요.`;
+  return `${esc(city)} 가까이에는 공개 자료가 적어 <b>반경을 넓혀</b> 찾은 장소예요. 이동 거리를 확인해 주세요.`;
+}
+/* 장소 0곳 도시(조사 모드): 이유별 안내와 '장소 직접 추가'. 예시(가짜) 장소로 채우지 않는다(10/26 결정). */
+const PLACE_NONE_KO = {
+  outage: '자료 서버가 지금 응답하지 않아 이 도시의 장소를 가져오지 못했어요. 잠시 뒤 다시 조사하거나, 가 보고 싶은 곳을 직접 추가해 주세요.',
+  no_coords: '이 도시의 위치를 찾지 못해 주변 장소를 조사하지 못했어요. 가 보고 싶은 곳을 직접 추가해 주세요.',
+  no_sources: '공개 여행 자료에 이 도시의 장소가 거의 없어요. 예시 장소로 채우지 않아요 — 가 보고 싶은 곳을 직접 추가해 주세요.',
+};
+PLACE_NONE_KO.no_places = PLACE_NONE_KO.no_article = PLACE_NONE_KO.no_sources;
+const ADD_KIND = { attraction: '관광지', restaurant: '맛집', cafe: '카페' };
+function addPlaceForm(city) {
+  return `<div class="card add-place"><b>장소 직접 추가</b>
+    <div class="add-place-row"><input id="add-place-name" type="text" maxlength="60" autocomplete="off" placeholder="장소 이름 (영어로 적으면 문장에 그대로 써요)" aria-label="장소 이름">
+    <select id="add-place-kind" aria-label="장소 종류">${Object.entries(ADD_KIND).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select>
+    <button type="button" class="btn primary" data-act="add-place" data-city="${esc(city)}">추가</button></div>
+    <div class="small">직접 추가한 장소는 출처가 없어요. 방문 전에 위치·영업 여부를 확인해 주세요.</div></div>`;
+}
+/* 직접 추가한 장소 확인(POST /place-check): 도시 근처에서 이름을 찾아 출처를 붙인다. 못 찾아도 장소는 그대로 둔다. */
+async function placeCheck(p) {
+  if (API.base === null || !S.trip) return;
+  const { country } = briefCtx(p.city);
+  const c = S.trip.cities.find(x => x.name === p.city);
+  const iso2 = (countryByName(country) || {}).iso2;
+  p.check = { state: 'loading' };
+  if (S.screen === 'u-report') render();
+  let d = null;
+  try {
+    const r = await fetch(`${API.base}/place-check`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ country: { name: country || p.city, ...(iso2 ? { iso2 } : {}) },
+                             city: { name: p.city, ...(c && c.gid ? { gid: c.gid } : {}) }, place: { name: p.name, kind: p.kind } }) });
+    d = r.ok ? await r.json() : null;
+  } catch (e) { d = null; }
+  const res = AI.placeCheckResult(d);
+  if (res.state === 'found') {
+    p.sources = [{ url: res.url, title: `${res.label} · ${res.name}` }];
+    p.attribution = `직접 추가 · 출처 확인(${res.license})`;
+    res.suggest = res.name.toLowerCase() !== p.name.toLowerCase() ? res.name : '';
+  }
+  p.check = res;
+  if (S.screen === 'u-report') render();
+}
+function placeCheckLine(p) {
+  const c = p.check;
+  if (!c) return '';
+  if (c.state === 'loading') return '<div class="small check-line">공개 자료에서 확인하는 중…</div>';
+  if (c.state === 'not_found') return '<div class="small check-line warn">공개 자료에서 찾지 못했어요 — 이름과 위치를 확인해 주세요.</div>';
+  if (c.state !== 'found') return '';
+  return `<div class="small check-line ok">공개 자료에서 확인했어요${c.km != null ? ` · 도시 중심에서 약 ${esc(String(c.km))}km` : ''}${c.suggest
+    ? ` <button type="button" class="link-btn" data-act="place-rename" data-id="${esc(p.id)}">‘${esc(c.suggest)}’(으)로 바꾸기</button>` : ''}</div>`;
+}
+function researchCredits() {
+  const a = S.reportMode === 'research' && S.research ? S.research.attributions || [] : [];
+  if (!a.length) return '';
+  return `<div class="small rinfo-credits">출처: ${a.map(x => esc(x.text)).join(' · ')}. 위키보이지 발췌는 CC BY-SA 4.0 으로 같은 조건에서 다시 쓸 수 있어요.</div>`;
+}
 function placeCard(p, locked) {
+  if (p.research) {
+    const tone = p.kind === 'attraction' ? 'attraction' : 'restaurant';
+    const links = (p.sources || []).map(s => `<a href="${esc(s.url)}" data-act="link" rel="noopener noreferrer">${esc(s.title)}</a>`)
+      .concat(p.homepage ? [`<a href="${esc(p.homepage)}" data-act="link" rel="noopener noreferrer">홈페이지</a>`] : []).join(' · ');
+    return `<div class="place ${p.selected ? 'on' : 'off'} ${locked ? 'locked' : ''}" data-act="place" data-id="${esc(p.id)}">
+      <div class="check">${p.selected ? I.check : ''}</div>
+      <div><div class="nm"><span class="kind ${tone}">${esc(p.primaryType)}</span>${esc(p.name)}${p.isCandidate ? '<span class="badge b-only">후보</span>' : ''}</div>
+        ${p.area ? `<div class="meta">${esc(p.area)}</div>` : ''}
+        ${p.desc ? `<div class="desc">${esc(p.desc)}${p.reason ? ` <span class="why">— ${esc(p.reason)}</span>` : ''}</div>` : ''}
+        ${p.descEn ? `<div class="desc${p.desc ? ' en-sub' : ''}" lang="${esc(p.descLang || 'en')}">${esc(p.descEn)}</div>` : ''}
+        <div class="src">${links}${links ? ' · ' : ''}${esc(p.attribution)}</div>${p.user ? placeCheckLine(p) : ''}</div></div>`;
+  }
   if (p.live) {
     const tone = p.kind === 'attraction' ? 'attraction' : 'restaurant';
     const chip = p.primaryType || (p.kind === 'cafe' ? '카페' : p.kind === 'attraction' ? '관광지' : '맛집');
@@ -4639,6 +4943,30 @@ const ACT = {
       }, { danger: true });
   },
 
+  'geo-more': el => geoMore(el.dataset.geoKey || (GEO.open && GEO.open.key)),
+  'brief-retry': el => { briefLoad(el.dataset.city, true); render(); },
+  'research-retry': () => { if (S.trip && S.trip.status === 'report_done') request('report', false); },
+  'add-place': el => {
+    const city = el.dataset.city, input = document.getElementById('add-place-name'), kindEl = document.getElementById('add-place-kind');
+    const name = String(input && input.value || '').replace(/\s+/g, ' ').trim();
+    const kind = ADD_KIND[kindEl && kindEl.value] ? kindEl.value : 'attraction';
+    if (!name || name.length > 60 || /[<>{}]/.test(name)) { toast('장소 이름을 1~60자로 적어 주세요.'); return; }
+    if (S.places.some(p => p.city === city && p.name.toLowerCase() === name.toLowerCase())) { toast('이미 목록에 있는 장소예요.'); return; }
+    const meta = S.reportMeta[city] || (S.reportMeta[city] = { base: 0, found: 0, mode: 'empty' });
+    const seq = S.places.length + 1;
+    const p = AI.researchPlace({ id: 'user:' + seq, name, kind, sources: [] }, city, 'u' + seq);
+    Object.assign(p, { attribution: '직접 추가', user: true, selected: selCount(city) < meta.base, isCandidate: false });
+    S.places.push(p);
+    meta.found = (meta.found || 0) + 1;
+    render();
+    placeCheck(p);
+  },
+  'place-rename': el => {
+    const p = S.places.find(x => x.id === el.dataset.id);
+    if (!p || !p.check || !p.check.suggest) return;
+    p.name = p.en = p.check.suggest; p.check.suggest = '';
+    render();
+  },
   'add-country': () => {
     if (S.draft.countries.length >= 4) { toast('국가는 최대 4개까지 입력할 수 있어요.'); return; }
     S.draft.countries.push('');
@@ -4903,7 +5231,10 @@ document.addEventListener('input', e => {
   }
   if (el.dataset.bind) {
     const k = el.dataset.bind.split('.');
-    if (k[0] === 'city') S.draft.cities[+k[1]][k[2]] = el.value;
+    if (k[0] === 'city') {
+      S.draft.cities[+k[1]][k[2]] = el.value;
+      if (k[2] === 'name') delete S.draft.cities[+k[1]].gid;   // 손으로 고친 이름은 목록에서 고른 그 도시가 아니다
+    }
     // 'country' 는 한 국가일 때의 옛 키 — 그때도 정본(countries[0])에 써야 도시 목록이 같은 국가를 본다
     else if (k[0] === 'country') { S.draft.countries[+(k[1] || 0)] = el.value; draftSync(S.draft); }
     else S.draft[k[0]] = el.value;

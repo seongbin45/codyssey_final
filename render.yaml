@@ -49,3 +49,52 @@ services:
       # 절대 저장소에 두지 않는다(docs/deploy/DEPLOY_RUNBOOK.md E).
       - key: FIREBASE_SERVICE_ACCOUNT_JSON
         sync: false
+      # 도시 조사 에이전트(app/research, docs/ops/RESEARCH_AGENT.md). 기본 꺼짐 — 1 이면 POST /research 가 키 없는 공개 소스
+      # (위키보이지·위키데이터·Open-Meteo·GOV.UK·Frankfurter)를 조사한다. 결과 캐시는 위 서비스 계정으로 Firestore 에 쓴다.
+      - key: RESEARCH_ENABLED
+        sync: false
+      # 위키미디어 User-Agent 연락처(선택, 기본은 저장소 URL). 없으면 공유 IP 가 익명 한도(10회/분)로 묶일 수 있다.
+      - key: WIKIMEDIA_CONTACT
+        sync: false
+      # langchain-core 가 끌고 오는 langsmith 로 아무것도 나가지 않게(코드도 강제로 끈다).
+      - key: LANGSMITH_TRACING
+        value: "false"
+      # 0 이면 LangGraph 없이 같은 노드를 순서대로(같은 결과). 메모리가 빠듯할 때의 탈출구.
+      - key: RESEARCH_USE_GRAPH
+        sync: false
+      # LLM 추출(여행 조건 순위·한국어 요약) 끄기(기본 켜짐 — Gemini 키가 없으면 저절로 꺼짐), 조사 안 Gemini 동시 수(기본 2)
+      - key: RESEARCH_LLM
+        sync: false
+      # 장소 대체 체인(위키보이지가 모자랄 때): 순서·끄기(none), 종류별 여유 수
+      - key: RESEARCH_PLACE_CHAIN
+        sync: false
+      - key: RESEARCH_PLACE_MIN_EXTRA
+        sync: false
+      # Google Places(New): 일정 에이전트와 조사의 실시간 보충이 함께 쓴다. 결과는 저장하지 않는다. 한도는 프로세스·UTC 하루
+      - key: GOOGLE_MAPS_API_KEY
+        sync: false
+      - key: ITINERARY_DAILY_CAP
+        sync: false
+      # 한국관광공사 TourAPI(한국 도시 장소 — 저장 가능). 언어별 키가 없으면 공통 TOURAPI_SERVICE_KEY.
+      # 일반 인증키는 계정당 하나라 보통 같은 값 — 서비스(언어)마다 활용신청만 따로. 조사는 영문 → 국문 순(TOURAPI_SERVICE 로 강제)
+      - key: TOURAPI_SERVICE_KEY
+        sync: false
+      - key: TOURAPI_KEY_KOR        # 국문 관광정보 서비스_GW (KorService2)
+        sync: false
+      - key: TOURAPI_KEY_ENG        # 영문 관광정보서비스_GW (EngService2)
+        sync: false
+      - key: TOURAPI_KEY_FRE        # 불어 관광정보서비스_GW (FreService2) — 지금은 안 씀
+        sync: false
+      - key: TOURAPI_KEY_JPN        # 일문 관광정보서비스_GW (JpnService2, 활용매뉴얼로 확인) — 지금은 안 씀
+        sync: false
+      - key: TOURAPI_KEY_CHS        # 중문 간체 관광정보서비스_GW (ChsService2, 활용매뉴얼로 확인) — 지금은 안 씀
+        sync: false
+      - key: TOURAPI_SERVICE
+        sync: false
+      - key: RESEARCH_LLM_CONCURRENCY
+        sync: false
+      # 백업 경로(도시 브리프 GET /city-brief) 끄기(기본 켜짐), /generate 프롬프트에 브리프 넣기(기본 꺼짐)
+      - key: CITY_BRIEF_ENABLED
+        sync: false
+      - key: CITY_BRIEF_PROMPT
+        sync: false

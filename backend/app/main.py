@@ -77,6 +77,7 @@ from .agents.itinerary import (
     google_maps_configured,
     itinerary_enabled,
 )
+from .research import service as research
 
 from .validators import (
     SCHEMA_CHECKER_AVAILABLE,
@@ -141,6 +142,7 @@ app.add_middleware(body_limit.BodyLimitMiddleware, default=64 * 1024, limits={
     "/user/state": 128 * 1024,
     "/user/interp-log": 96 * 1024,
     "/generate": 64 * 1024,
+    "/research": 16 * 1024,      # 나라 4 × 80자 + 도시 5 × (80자 + 날짜·숫자) — 2KB 안팎
 })
 app.add_middleware(
     CORSMiddleware,
@@ -263,6 +265,52 @@ class ItineraryRequest(BaseModel):
     days: int | None = None
     start_date: str | None = Field(default=None, max_length=10)
     itinerary_kinds: list[str] = Field(default_factory=list, max_length=4)
+
+
+class ResearchCountry(BaseModel):
+    model_config = {"extra": "forbid"}
+    name: str = Field(min_length=1, max_length=80)
+    iso2: str | None = Field(default=None, pattern=r"^[A-Z]{2}$")
+
+
+class ResearchCity(BaseModel):
+    """도시 하나. gid 는 목록에서 고른 도시의 GeoNames id(없으면 이름으로 찾는다). attr·rest 는 화면이 그 도시에 둘 장소 수."""
+    model_config = {"extra": "forbid"}
+    name: str = Field(min_length=1, max_length=80)
+    gid: int | None = Field(default=None, ge=1, le=2 ** 31 - 1)
+    ci: int = Field(default=0, ge=0, le=3)
+    start: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    end: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    attr: int = Field(default=2, ge=0, le=12)
+    rest: int = Field(default=2, ge=0, le=12)
+
+
+class ResearchRequest(BaseModel):
+    """조사 요청 — 나라·도시·날짜만. 사용자 정보(uid·이메일)는 없다. cache_only 면 캐시에 있을 때만 준다(복원용)."""
+    model_config = {"extra": "forbid"}
+    countries: list[ResearchCountry] = Field(min_length=1, max_length=4)
+    cities: list[ResearchCity] = Field(min_length=1, max_length=5)
+    cache_only: bool = False
+
+
+class PlaceCheckCity(BaseModel):
+    model_config = {"extra": "forbid"}
+    name: str = Field(min_length=1, max_length=80)
+    gid: int | None = Field(default=None, ge=1, le=2 ** 31 - 1)
+
+
+class PlaceCheckPlace(BaseModel):
+    model_config = {"extra": "forbid"}
+    name: str = Field(min_length=1, max_length=60)
+    kind: str = Field(default="attraction", pattern=r"^(attraction|restaurant|cafe)$")
+
+
+class PlaceCheckRequest(BaseModel):
+    """직접 추가한 장소 확인 — 장소 이름·도시·나라만(사용자 정보 없음)."""
+    model_config = {"extra": "forbid"}
+    country: ResearchCountry
+    city: PlaceCheckCity
+    place: PlaceCheckPlace
 
 
 class WithdrawReport(BaseModel):
@@ -517,6 +565,8 @@ def health_detail() -> dict[str, Any]:
         # 사실 경로의 구글 장소 검색은 붙이지 않았다. google_places 는 그 의미로 남긴다.
         # 일정 플래그와 키는 호출 때마다 읽는다. 임포트 때 고정하지 않는다.
         "itinerary_enabled": itinerary_enabled(),
+        # 도시 조사 에이전트(키 없는 공개 소스): 켜짐·LangGraph 설치·소스·잡 수. 키 값은 없다.
+        "research": research.health(),
         "fact_agents": {
             "kakao": kakao_configured(),
             "osm": "no-key",
@@ -592,6 +642,68 @@ def post_itinerary(req: ItineraryRequest, request: Request) -> dict[str, Any]:
         return {"status": "unavailable", "reason": "itinerary_error"}
 
 
+_polls: dict[str, deque[float]] = defaultdict(deque)
+_polls_lock = threading.Lock()
+POLL_LIMIT, POLL_WINDOW = 60, 60
+
+
+def _poll_limit(request: Request) -> None:
+    """조사 진행 폴링 전용 제한(2.5~5초 간격 폴링이 공용 rate_limit 20/분을 다 쓰지 않게)."""
+    ip = client_ip(request)
+    with _polls_lock:
+        now = time.time()
+        if len(_polls) > 5_000:
+            for k in [k for k, v in _polls.items() if not v or now - v[-1] > POLL_WINDOW]:
+                del _polls[k]
+        q = _polls[ip]
+        while q and now - q[0] > POLL_WINDOW:
+            q.popleft()
+        if len(q) >= POLL_LIMIT:
+            raise HTTPException(status_code=429, detail="too_many_polls", headers={"Retry-After": "5"})
+        q.append(now)
+
+
+@app.post("/research")
+def post_research(req: ResearchRequest, request: Request) -> Any:
+    """사용자가 고른 나라·도시를 여행 조건에 맞게 조사한다(backend/app/research).
+
+    꺼져 있으면 외부 호출 없이 unavailable. 전부 캐시에 있으면 바로 done+report, 아니면 잡을 시작하고 202 job_id.
+    """
+    rate_limit(request)
+    try:
+        res = research.submit(req.model_dump(), ai_client_key(request))
+    except research.Busy:
+        raise HTTPException(status_code=503, detail="busy", headers={"Retry-After": "15"})
+    except Exception as exc:  # noqa: BLE001 — 조사 실패는 화면이 예시로 돌아가게 unavailable
+        logging.getLogger("app.research").warning("research error %s", type(exc).__name__)
+        return {"status": "unavailable", "reason": "research_error"}
+    return JSONResponse(res, status_code=202) if res.get("status") == "running" else res
+
+
+@app.get("/research/{job_id}")
+def get_research(job_id: str, request: Request) -> dict[str, Any]:
+    _poll_limit(request)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{16,32}", job_id):
+        raise HTTPException(status_code=404, detail="unknown_job")
+    got = research.poll(job_id)
+    if got is None:
+        raise HTTPException(status_code=404, detail="unknown_job")
+    return got
+
+
+@app.post("/place-check")
+def post_place_check(req: PlaceCheckRequest, request: Request) -> dict[str, Any]:
+    """사용자가 직접 추가한 장소를 도시 근처에서 찾아 좌표·출처를 붙인다(research/place_check).
+    TourAPI(한국) → Wikidata → Google(실시간, 저장 안 함). 못 찾으면 not_found — 화면은 '직접 추가' 그대로."""
+    rate_limit(request)
+    from .research import place_check
+    try:
+        return place_check.check(req.model_dump())
+    except Exception as exc:  # noqa: BLE001 — 확인 실패는 화면에 영향이 없다(직접 추가 그대로)
+        logging.getLogger("app.research").warning("place-check error %s", type(exc).__name__)
+        return {"status": "unavailable", "reason": "place_check_error"}
+
+
 def _generate(req: GenerateRequest, request: Request) -> dict[str, Any]:
     rate_limit(request)
     ai.set_client(ai_client_key(request))   # AI 시도 예산을 IP 별로 센다(gemini.budget_reserve)
@@ -613,6 +725,8 @@ def _generate(req: GenerateRequest, request: Request) -> dict[str, Any]:
             if isinstance(s, dict) and isinstance(s.get("situation_id"), str)
         ],
     )
+    # 백업 경로: 도시 브리프의 출처 붙은 문단(CITY_BRIEF_PROMPT=1 일 때만, 기본 꺼짐 — city_brief_prompt).
+    facts["city_brief"] = city_brief_prompt("", req.city)
     # 일정은 문장 팩 결과에 의존하지 않는다. 겹치면 벽시계는 합이 아니라 큰 쪽이다.
     box: dict[str, Any] = {}
 
@@ -656,7 +770,7 @@ def _generate_sentences(
             "facts": facts,
         }
 
-    prompt = build_prompt(cfg, req, facts)
+    prompt = build_prompt(cfg, req, facts) + city_facts_clause(facts.get("city_brief"))
     state: dict[str, Any] = {"last_error": "", "last_pack": None, "last_issues": [], "attempt_ms": []}
 
     def once(client: Any, model: str, attempt: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -1028,9 +1142,52 @@ def geo_countries() -> Any:
 
 @app.get("/geo/cities")
 def geo_cities(country: str = Query(..., min_length=2, max_length=2), q: str = Query("", max_length=60),
-               limit: int = Query(20, ge=1, le=50)) -> Any:
-    """그 나라에서 사람이 고를 만한 도시(인구 상위)를 이름으로 찾는다. q 가 비면 인구 상위."""
-    return _geo_response(lambda: geo.cities_payload(country, q, limit))
+               limit: int = Query(20, ge=1, le=2000), offset: int = Query(0, ge=0, le=10_000_000)) -> Any:
+    """그 나라 도시를 이름으로 찾는다. q 가 비면 인구순 전체를 offset 부터 쪽으로(생략 없이 끝까지 넘길 수 있다)."""
+    return _geo_response(lambda: geo.cities_payload(country, q, limit, offset))
+
+
+@app.get("/city-brief")
+def city_brief(request: Request, country: str = Query("", max_length=80), city: str = Query(..., min_length=1, max_length=80),
+               lang: str = Query("ko", max_length=2)) -> Any:
+    """도시 브리프 — 백업(롤백) 경로. 본 경로(POST /research)가 꺼져 있거나 실패했을 때 화면이 부른다.
+
+    위키백과(한/영)·위키여행·위키데이터를 병렬 조회해 교차검증한다(agents/city_research). LLM 없음, 원문 발췌 + 출처.
+    끄기: CITY_BRIEF_ENABLED=0.
+    """
+    rate_limit(request)
+    from .agents import city_research                      # 앱 시작 경로에서 떼어 둔다
+    if not city_research.enabled():
+        return {"ok": False, "reason": "city_brief_disabled"}
+    try:
+        return city_research.research(country, city, "en" if lang == "en" else "ko")
+    except city_research.ResearchError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def city_brief_prompt(country: str, city: str) -> dict[str, Any]:
+    """CITY_BRIEF_PROMPT=1 일 때만: 도시 브리프를 facts 규약으로(출처 붙은 문단만). 실패는 unavailable — 생성은 계속된다.
+    기본 꺼짐 — /generate 마다 외부 조회(첫 회)가 붙기 때문이다. 조사 파이프라인 연결(PR5)이 들어오면 그쪽이 본 경로다."""
+    if (os.getenv("CITY_BRIEF_PROMPT") or "").strip() != "1":
+        return {"status": "unavailable", "reason": "city_brief_prompt_off"}
+    try:
+        from .agents import city_research
+        if not city_research.enabled():
+            return {"status": "unavailable", "reason": "city_brief_disabled"}
+        return city_research.prompt_facts(country, city)
+    except Exception as exc:                                   # noqa: BLE001
+        logging.getLogger("app.research").warning("city brief error %s", type(exc).__name__)
+        return {"status": "unavailable", "reason": "research_error"}
+
+
+def city_facts_clause(brief: dict[str, Any] | None) -> str:
+    """CITY_CONTEXT: 출처 붙은 도시 사실만 배경으로. 없으면 아무것도 붙이지 않는다('verified 만 사실' 규약과 같은 문법)."""
+    if not brief or brief.get("status") not in ("verified", "partial") or not brief.get("items"):
+        return ""
+    items = [f"- [{i['kind']}] {i['text']} (source: {i['url']})" for i in brief["items"][:6]]
+    return ("\n\nCITY_CONTEXT (sourced, may be used as background only):\n" + "\n".join(items)
+            + f"\nAttribution: {brief.get('attribution', '')}"
+            + "\nUse these only as background. Do not add facts that are not listed here.")
 
 
 @app.get("/auth/config")
