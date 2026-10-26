@@ -729,11 +729,14 @@ function placeSentences(p, n) {
     ai: s.kind === 'ai', sample: s.kind === 'sample',
   }));
   const used = new Set(ai.map(s => s.en.toLowerCase()));
+  // 조사한 장소면 그 장소 어휘(대표 음식·볼거리·종류)로 만든 슬롯 문장을 범용 틀보다 먼저(AI 호출 없음)
+  const slot = AI.vocabSentences(p, Math.max(0, n - ai.length)).filter(s => !used.has(s.en.toLowerCase()));
+  slot.forEach(s => used.add(s.en.toLowerCase()));
   const bank = PLACE_TEMPLATES[p.kind] || (p.kind === 'cafe' ? PLACE_TEMPLATES.restaurant : []);
   const usable = bank.filter(t => !p.live || !(t.en + t.ko).includes('{menu'));
   const rest = usable.map(t => ({ situation: t.situation, en: fill(t.en), ko: fill(t.ko) }))
-    .filter(t => !used.has(t.en.toLowerCase())).slice(0, Math.max(0, n - ai.length));
-  return [...ai, ...rest];
+    .filter(t => !used.has(t.en.toLowerCase())).slice(0, Math.max(0, n - ai.length - slot.length));
+  return [...ai, ...slot.map(s => ({ situation: s.situation, en: s.en, ko: s.ko, vocab: s.vocab })), ...rest];
 }
 
 /* AI 풀 키: 도시 + 카테고리 (카테고리가 없으면 AI 대상 아님) */
@@ -869,7 +872,8 @@ function tick(tok, stage) {
 /* 실제 장소는 맛집만 /generate 로 보낸다. 카페·관광지는 문장 요청에 넣지 않는다.
    예시 장소는 기존과 같이 categoryOfKind 가 있는 종류만 보낸다. 관광지는 null 이라 빠진다. */
 function sentenceCategory(p) {
-  if (p.live && p.kind !== 'restaurant') return null;
+  // Google 일정 경로(설명 없음)의 관광지·카페는 범용 틀만. 도시 조사 장소는 관광지·카페도 AI 문장(관광지 계약·어휘 제약)
+  if (p.live && !p.research && p.kind !== 'restaurant') return null;
   return AI.categoryOfKind(p.kind);
 }
 /* 선택한 맛집의 문장만 /generate 로 만든다. 일정·문장 수 계산(R.counts)은 그대로 코드가 한다.
@@ -882,7 +886,8 @@ async function runAi(tok) {
   const groups = {};
   S.places.filter(p => p.selected && sentenceCategory(p)).forEach(p => {
     const cat = sentenceCategory(p);
-    (groups[aiKey(p.city, cat)] ??= { name: p.city, categoryId: cat, places: [] }).places.push({ id: p.id, name: p.name, en: p.en, kind: p.kind });
+    (groups[aiKey(p.city, cat)] ??= { name: p.city, categoryId: cat, places: [], researchKey: researchKeyOf(p.city) })
+      .places.push({ id: p.id, name: p.name, en: p.en, kind: p.kind, user: !!(p.user || (p.research && p.provider === 'google')) });
   });
   const cities = Object.values(groups);
   if (!cities.length) return;
@@ -911,7 +916,8 @@ async function refreshAiSentences() {
   const groups = {};
   S.places.filter(p => p.selected && sentenceCategory(p)).forEach(p => {
     const cat = sentenceCategory(p);
-    (groups[aiKey(p.city, cat)] ??= { name: p.city, categoryId: cat, places: [] }).places.push({ id: p.id, name: p.name, en: p.en, kind: p.kind });
+    (groups[aiKey(p.city, cat)] ??= { name: p.city, categoryId: cat, places: [], researchKey: researchKeyOf(p.city) })
+      .places.push({ id: p.id, name: p.name, en: p.en, kind: p.kind, user: !!(p.user || (p.research && p.provider === 'google')) });
   });
   const cities = Object.values(groups);
   let out;
@@ -2324,7 +2330,7 @@ function tripFields(d, E, v) {
         <div class="err" data-err="cities">${i === 0 ? (E.cities || '') : ''}</div>
       </div></div>`;
 
-  return `<div class="field"><label>국가와 도시</label>
+  return `<div class="field"><label>국가</label>
       ${multi ? `<div class="geo-par">${d.countries.map((_, i) => col(i)).join('')}</div>`
               : `${col(0)}`}
       ${addCountry}
@@ -2821,6 +2827,11 @@ function briefCard(cityName) {
   return `<div class="card brief-card"><div class="brief-h"><b>${esc(city)} 알아두기</b><span class="brief-tag">${conf}</span>
       <button type="button" class="brief-retry" data-act="brief-retry" data-city="${esc(cityName)}" title="다시 조사" aria-label="다시 조사">↻</button></div>
     ${rows}${gaps}<p class="brief-attr">${esc(d.attribution || '')}</p></div>`;
+}
+/* 문장 생성(/generate)에 보낼 도시 조사 키 — 조사 모드일 때만(예시·Google 일정 모드에서는 보내지 않는다) */
+function researchKeyOf(city) {
+  const inf = S.reportMode === 'research' && S.research && S.research.cities ? S.research.cities[city] : null;
+  return inf && inf.key ? inf.key : '';
 }
 /* 후퇴(복구)로 찾은 장소 안내: 옛 지명 → 지금 도시, 상위 구역 기준, 반경을 넓혀 찾음 */
 function fallbackNotice(city, fb) {

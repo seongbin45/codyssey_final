@@ -126,6 +126,36 @@ GeoNames 에서 못 찾은 도시(좌표 없음 → 날씨·주변 검색 불가
 - 실패·꺼짐·마감(`RESEARCH_SOFT_DEADLINE_S`)이면 보고서는 listing 순서·영어 원문 그대로(`cities[].extract.status`: ok·failed·busy·disabled·deadline·empty). 실패는 캐시하지 않는다. 마감에 걸린 추출은 뒤에서 끝까지 돌아 캐시만 데운다(Gemini 장애 때 최소 시도 규칙으로 몇 분 걸려도 화면은 150초 안에 listing 보고서를 받는다).
 - 화면: 장소 카드에 한국어 요약 — 이유, 그 아래 영어 원문(작게). 실용 정보는 한국어 요약 + 인용(blockquote).
 
+## 장소 어휘 (`research/vocab.py`)
+
+보고서의 장소마다 `vocab: [{en, kind: dish|feature|type, src}]`(최대 4개) — 문장 슬롯·문장 생성 제약에 쓴다.
+
+- 코드(결정적·무료): 여행 어휘 사전(음식·볼거리·종류) + 패턴("specializes in X", "famous for X", "serves X", "houses a X" …, 원문 그대로 1~3 낱말, 꾸밈말 제거) + OSM cuisine·TourAPI 신분류 매핑 + 이름의 머리 명사(Market Square → square, 독일어·이탈리아어·일본어 이름의 종류 낱말).
+- LLM(PR3 추출, 도시당 1회): `places[].vocab` 최대 3개 — 이름·설명에 **그대로 있는** 낱말만 통과.
+- 영어 설명만 읽는다(다른 언어 설명이면 이름의 종류만).
+- **골든 코퍼스**: `backend/tests/fixtures/research_golden/` — 실제 8개 도시(도쿄·나라·군산·로텐부르크·마테라·쿠스코·호이안·뉴욕, 2026-10-26 수집, CC BY-SA/CC0) 장소 301곳 → `expected/vocab.json`. 규칙을 바꾸면 `python scripts/update_research_golden.py`(확인만: `--check`) 후 diff 를 보고 커밋.
+- **속성 테스트**: 무작위·악의적 입력 800건 — 낱말은 짧고 숫자·기호·URL 없음, 패턴·LLM 낱말은 원문에 있음, 중복 없음, 최대 4개.
+
+## 문장 만드는 방식 (PR-V2)
+
+| 방식 | 언제 | 무엇 |
+|---|---|---|
+| ① Gemini + 어휘 제약 | 서버에 키가 있을 때 | `RESEARCHED_PLACES` 에 장소별 `vocab` — "장소 이름이나 그 어휘를 쓸 것, 목록 밖 음식·볼거리 금지". 검증 `place_sentence_ungrounded`: 장소 문장 절반 넘게 어기면 block(다시 생성, 이유가 다음 시도 프롬프트에), 일부면 warn |
+| ② 관광지 카테고리 | 관광지 장소 | `agent_contract/categories/attraction.json`(입장권·운영 시간·입구·가이드 투어·사진·길·대표 볼거리·짐·할인·기념품, 금지어·negative case 5개) — 조사한 관광지·카페도 AI 문장 요청(Google 일정 경로의 장소는 그대로 범용 틀) |
+| ③ 어휘 슬롯 틀(오프라인) | AI 실패·키 없음·AI 문장이 모자랄 때 | `mockup/ai.js vocabSentences` — 볼거리("Where can I see the {v}?")·음식("I'd like to try the {v}, please.")·종류("What time does the {v} close today?", 문을 닫지 않는 광장·거리·섬… 은 "Is the {v} far from here?")를 낱말마다 다른 틀로. 한국어는 영어 낱말을 ‘ ’ 로, 종류는 한국어 낱말 + 은/는. 범용 틀(PLACE_TEMPLATES)보다 먼저 |
+
+회귀: 슬롯 문장 골든(`mockup/test-fixtures/vocab_sentences.json` ← 백엔드 골든 어휘, `node mockup/scripts/update-vocab-sentences.js`), 속성(골든 전체 905문장 + 무작위·악의적 600건: 15단어 이하·영어에 그 어휘·자리표시자 없음·중복 없음·음식점엔 입구 틀 없음), e2e(`test_research_report`: 슬롯 문장 순서·관광지 AI 요청).
+
+## 문장 생성 연결 (PR5, `research/grounding.py`)
+
+화면은 조사 모드일 때 `/generate` 에 도시 키 `research_key`(보고서 `cities[].key`)를 싣고, 직접 추가·실시간(Google) 장소엔 `user: true` 를 붙인다.
+
+- 서버는 **캐시에서만** 그 도시의 조사 장소를 꺼낸다(외부 호출 0). 조사 장소(`user` 아님)인데 캐시에 없으면 **걸러 낸다**(422 아님). `user` 장소는 그대로, 사실은 안 붙임.
+- 남은 조사 장소의 영어 설명(원문 발췌 200자, URL·꺾쇠 제거, 최대 12곳)을 `RESEARCHED_PLACES` 로 프롬프트 끝에 붙인다. 기존 `VERIFIED_FACTS` 에는 섞지 않는다(걸러진 이름이 모델에 가지 않게).
+- 생성 뒤 요청하지 않은 장소 이름의 문장은 뺀다(`place_not_in_request` warn). 전부 빠지게 되면 빼지 않는다(화면이 거른다).
+- 응답 `facts.research = {status: off|miss|ok, filtered, grounded}`. 캐시가 없거나 만료면 `miss` — 예전과 같은 동작. 조사가 꺼져 있으면 `off`.
+- 설명 문서(과제용 Agent+RAG): [`docs/product/RESEARCH_AGENT.md`](../product/RESEARCH_AGENT.md).
+
 ## 캐시 (Firestore, 서비스 계정 전용 — 클라이언트 규칙은 그대로 전부 거부)
 
 | 경로 | 내용 | 수명 | 라이선스 |
