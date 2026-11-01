@@ -443,6 +443,19 @@ with sync_playwright() as p:
     check("카드를 보다 홈에서 새로고침해도 학습 위치(카드·뒤집은 수)가 남음", back2 == made2 and made2["n"] == 1, f"{made2} -> {back2}")
     ctx.close()
 
+    # --- 깜빡임 진단(?diag=1): 평소에는 로드되지 않고, 붙였을 때만 렌더 횟수 표시와 로그 복사 버튼이 생긴다 ---
+    ctx = b.new_context(viewport={"width": 390, "height": 844}, has_touch=True, is_mobile=True)
+    page = ctx.new_page(); page.on("pageerror", lambda e: errors.append(str(e)))
+    page.goto(BASE + "/?demo=1"); page.wait_for_timeout(900)
+    check("진단 도구: 평소에는 로드되지 않음", page.evaluate("typeof window.__diag") == "undefined" and page.locator("button:has-text('로그 복사')").count() == 0)
+    page.goto(BASE + "/?demo=1&diag=1"); page.wait_for_timeout(1200)
+    page.evaluate("navFromMenu('u-home')"); page.wait_for_timeout(300)
+    page.locator('.pnav button[data-id="u-coll"]').tap(); page.wait_for_timeout(500)
+    ov = page.evaluate("(document.querySelector('div[style*=monospace]')||{}).textContent || ''")
+    check("진단 도구: ?diag=1 이면 렌더 횟수 표시 + 복사 버튼, 화면 이름이 기록됨",
+          "render 5s:" in ov and page.locator("button:has-text('로그 복사')").count() == 1 and any("render u-coll" in x for x in page.evaluate("window.__diag.log")), ov)
+    ctx.close()
+
     # --- 실제 터치 제스처 주입(CDP): 한 번 밀면 카드 한 장 (c76335a 같은 스와이프 회귀를 잡는다) ---
     # has_touch=True 만으로는 제스처가 발생하지 않는다. Input.dispatchTouchEvent 로 touchStart→move→End 를 직접 보낸다.
     def swipe(page, cdp, dx, steps=6):

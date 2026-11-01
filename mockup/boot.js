@@ -12,3 +12,9 @@
 
 /* 화면 모드: 기본=제품(반응형 셸) · ?demo=1(또는 예전 주소 ?menu=1)=제품+데모 서랍 · ?demo=1&frame=1=예전 데모 레이아웃(폰 프레임+사이드 패널) */
 (function () { var q = new URLSearchParams(location.search); document.documentElement.dataset.mode = q.get('demo') === '1' || q.get('menu') === '1' ? (q.get('frame') === '1' ? 'legacy' : 'demo') : 'product'; })();
+
+/* 깜빡임 진단: 주소에 ?diag=1 이 있을 때만 diag.js 를 불러온다(평소 로드·전송 없음). 화면에 렌더 횟수를 띄우고 로그를 복사할 수 있다 */
+(function () {
+  if (new URLSearchParams(location.search).get('diag') !== '1') return;
+  var s = document.createElement('script'); s.src = 'diag.js'; s.defer = true; document.head.appendChild(s);
+})();
