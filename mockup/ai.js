@@ -6,7 +6,7 @@
   const WEAK_KEY = 'cd_weak';
   /* 말하기 연습 동의. 문구를 바꾸면 CONSENT_VERSION 을 올려 다시 동의를 받는다. */
   const CONSENT_KEY = 'cd_consent';
-  const CONSENT_VERSION = 7;   // v2 Gemini 무료 등급·민감정보 / v3 2단계 처리 / v4 서버 VAD + 전용 STT / v5 교차검증 전송 / v6 말소리 재확인은 서버 안(pyannoteAI 미전송) / v7 계정에 올리는 것에 여행 설정 포함
+  const CONSENT_VERSION = 9;   // v2 Gemini 무료 등급·민감정보 / v3 2단계 처리 / v4 서버 VAD + 전용 STT / v5 교차검증 전송 / v6 말소리 재확인은 서버 안(pyannoteAI 미전송) / v7 계정에 올리는 것에 여행 설정 포함 / v8 음소 분석 PC(켜져 있을 때만) / v9 PC 가 모두 꺼지면 클라우드 발음 평가(Azure·Speechace)
   /* 임시 제품 규칙: 이 점수 미만이면 "취약 상황" 후보로 저장한다. 검증된 학습 기준이 아니다. */
   const WEAK_THRESHOLD = 70;
   /* 참고 신호: 들린 문장이 목표 문장의 단어를 이 비율 미만으로 담으면 "다르게 들렸어요"로 표시한다 (저장 판정에 쓰지 않음). */
@@ -21,6 +21,9 @@
   /* ---------- 서버 주소 ----------
      ?api=https://host 는 이번 방문에서만 쓰고 저장하지 않는다. 녹음이 전송될 서버를 바꾸므로 external 로 알린다.
      http(s) 로 열렸으면 같은 출처(''), file:// 이면 null(폴백 전용). */
+  /* Firebase Hosting(*.web.app · *.firebaseapp.com)은 화면(정적 파일)만 낸다 — API·통역 WebSocket 은 Render 서버로 간다
+     (11/06: Cloud Run 은 마감 때문에 보류, docs/ops/FIREBASE_DEPLOY.md §0). ?api= 가 있으면 그것이 먼저다. */
+  const HOSTED_API = 'https://codyssey-final.onrender.com';
   function apiBase(loc) {
     const protocol = loc.protocol || '';
     const own = protocol === 'http:' || protocol === 'https:';
@@ -34,6 +37,9 @@
           return { base: origin, external: !own || origin !== loc.origin, host: u.host };
         }
       } catch (e) { /* 잘못된 주소는 무시 */ }
+    }
+    if (own && /\.(web\.app|firebaseapp\.com)$/i.test(String(loc.hostname || loc.host || '').replace(/:\d+$/, ''))) {
+      return { base: HOSTED_API, external: false, host: HOSTED_API.replace(/^https:\/\//, '') };   // 우리 서버라 '외부 서버' 안내는 띄우지 않는다
     }
     if (own) return { base: '', external: false, host: loc.host || '' };
     return { base: null, external: false, host: '' };
@@ -125,7 +131,9 @@
         // 사용자가 직접 추가했거나 실시간(Google) 장소는 user 로 표시 — 조사 캐시와 맞춰 보지 않는다.
         return postJson(fetchImpl, base + '/generate', {
           category_id: cat, city: c.name,
-          places: c.places.map(p => ({ name: p.en || p.name, place_type: p.kind || cat, ...(p.user ? { user: true } : {}) })),
+          // 사용자가 확인 창에서 '맞아요'로 확인한 주소만 함께 보낸다(서버 USER_CONFIRMED_PLACES — 지어내지 않게)
+          places: c.places.map(p => ({ name: p.en || p.name, place_type: p.kind || cat, ...(p.user ? { user: true } : {}),
+            ...(p.user && typeof p.address === 'string' && p.address ? { address: p.address.slice(0, 200) } : {}) })),
           weak_expressions: weak,
           ...(RESEARCH_KEY_RE.test(c.researchKey || '') ? { research_key: c.researchKey } : {}),
         }, t.signal);
@@ -395,6 +403,68 @@
     return n.getFullYear() + '-' + m + '-' + d;
   }
   const ITINERARY_KINDS = ['restaurant', 'cafe', 'attraction'];
+  /* /speak-check 의 phonemes(app/phonemes.py consensus) → 화면 한 줄. 두 받아쓰기가 같은 차이를 낸 단어(diff)만, 최대 3개.
+     받아쓴 글자에서 나온 음소라 basis 가 transcript 면 그렇게 밝힌다. 보여줄 게 없으면 ''. */
+  /* 말해보기 결과 카드용 순수 함수들 — 화면(app.js speakCardHtml)이 그대로 그린다. */
+  /* 목표 문장을 단어로 나누고, 두 받아쓰기 모두에서 들리지 않은 단어(diff.missing, 문장 순서)에 miss 표시.
+     같은 단어가 여러 번이면 앞에서부터 하나씩 짝짓는다. 원문 글자(대소문자·구두점)는 그대로 보여준다. */
+  function wordMarks(target, missing) {
+    const want = (Array.isArray(missing) ? missing : []).map(w => String(w).toLowerCase());
+    let k = 0;
+    return String(target || '').split(/\s+/).filter(Boolean).map(raw => {
+      const norm = raw.toLowerCase().replace(/’/g, "'").replace(/[^a-z0-9']/g, '');
+      const miss = !!norm && k < want.length && want[k] === norm;
+      if (miss) k += 1;
+      return { w: raw, miss };
+    });
+  }
+  /* 음소 노드 결과(phonemes_acoustic.phonemes, 시간순) → 단어별 묶음. 연속한 같은 단어끼리 묶는다. */
+  function phonemeGroups(rows) {
+    const out = [];
+    (Array.isArray(rows) ? rows : []).forEach(r => {
+      if (!r || !r.ipa || !['ok', 'weak', 'missing'].includes(r.status)) return;
+      const last = out[out.length - 1];
+      if (last && last.word === r.word) last.items.push(r); else out.push({ word: r.word || '', items: [r] });
+    });
+    return out;
+  }
+  /* 판정 한 줄. 음소 결과가 있으면 그것(실제 소리)으로, 없으면 단어 일치로만. 점수를 '발음 점수'로 부르지 않는다. */
+  function speakVerdict(score, rows) {
+    const list = Array.isArray(rows) ? rows : [];
+    const missing = list.filter(r => r && r.status === 'missing').length;
+    const weak = list.filter(r => r && r.status === 'weak').length;
+    const s = typeof score === 'number' ? score : null;
+    if (list.length) {
+      if (!missing && !weak && (s === null || s >= 90)) return { text: '아주 잘했어요', tone: 'ok' };
+      if (missing + weak <= 2) return { text: '한두 소리만 고치면 돼요', tone: 'mid' };
+      return { text: '소리를 몇 개 더 다듬어 봐요', tone: 'mid' };
+    }
+    if (s !== null && s >= 90) return { text: '단어를 모두 알아들었어요', tone: 'ok' };
+    if (s !== null && s >= 60) return { text: '빠진 단어만 채우면 돼요', tone: 'mid' };
+    return { text: '천천히 한 번 더 말해 봐요', tone: 'low' };
+  }
+  function phonemeNotes(ph, max = 3) {
+    if (!ph || !Array.isArray(ph.words)) return '';
+    const sym = x => `/${String(x || '')}/`;
+    const notes = ph.words.filter(w => w && w.status === 'diff' && Array.isArray(w.ops)).slice(0, max).map(w => {
+      const d = w.ops.filter(o => o && o.op !== 'eq').map(o =>
+        o.op === 'sub' ? `${sym(o.ref_ipa)}→${sym(o.hyp_ipa)}` : o.op === 'del' ? `${sym(o.ref_ipa)} 빠짐` : `${sym(o.hyp_ipa)} 더해짐`);
+      return d.length ? `${w.word} ${d.join(' ')}` : '';
+    }).filter(Boolean);
+    if (!notes.length) return '';
+    return `소리 차이${ph.basis === 'transcript' ? '(받아쓴 글자 기준)' : ''}: ${notes.join(' · ')}`;
+  }
+  /* /speak-check 의 phonemes_acoustic(음소 노드, 실제 소리 기준) → 화면 한 줄. 노드가 없거나 실패면 ''.
+     가장 약한 음소 하나(focus)와 한국어 조음 안내. 틀린 곳이 없으면 일치율만. 발음 점수라고 부르지 않는다. */
+  function acousticNote(pa) {
+    if (!pa || pa.status !== 'ok') return '';
+    const f = pa.focus;
+    if (f && f.word && f.ipa) {
+      const heard = f.heard_as ? `가 /${f.heard_as}/처럼 들렸어요` : ' 소리가 약했어요';
+      return `소리 분석(실제 음성): '${f.word}'의 /${f.ipa}/${heard}${f.tip ? ` — ${f.tip}` : ''}`;
+    }
+    return typeof pa.phoneme_accuracy === 'number' ? `소리 분석(실제 음성): 목표 음소 ${Math.round(pa.phoneme_accuracy)}%가 들렸어요` : '';
+  }
   /* iso2·gid 는 검색 위치 편향용(선택). 서버가 이 둘로 도시 목록에서 좌표를 찾는다 — 좌표는 보내지 않는다. */
   function itineraryRequestBody(city, iso2) {
     const days = isoDiff(city && city.end, city && city.start) + 1;
@@ -698,8 +768,25 @@
     const name = typeof d.name === 'string' ? d.name.replace(/\s+/g, ' ').trim().slice(0, 120) : '';
     if (d.status !== 'found' || !name || /[<>{}]/.test(name) || !/^https:\/\/[^\s"'<>]+$/.test(src.url || '')) return { state: 'error' };
     const prov = RESEARCH_PROVIDER[src.provider] ? src.provider : 'wikidata';
+    /* 확인 창에 보일 주소·사진(11/05). 주소는 글자만, 사진은 위키미디어 공용 썸네일 주소만 받는다 —
+       화면은 그 주소를 직접 부르지 않고 GET /place-photo 로 서버가 받아 준다(CSP img-src 'self'). */
+    const address = typeof d.address === 'string' ? d.address.replace(/[<>{}]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160) : '';
+    const im = d.image && typeof d.image === 'object' ? d.image : null;
+    // 사진은 저작자·라이선스가 있을 때만(CC BY-SA 표시 요건: 저작자 · 라이선스 · 원본 링크)
+    const txt = (v, n) => typeof v === 'string' ? v.replace(/[<>{}]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, n) : '';
+    // Google 사진: 화면이 바로 부르는 짧게 쓰는 주소(googleusercontent) + 찍은 사람 표시. 저장하지 않는다
+    const gimage = im && im.provider === 'google' && /^https:\/\/[a-z0-9-]+\.googleusercontent\.com\/[^\s"'<>]+$/.test(im.src || '')
+      ? { src: im.src, provider: 'google', credit: 'Google 지도',
+          authors: (Array.isArray(im.authors) ? im.authors : []).slice(0, 3).map(a => ({ name: txt(a && a.name, 60) || 'Google 사용자',
+            uri: /^https:\/\/[^\s"'<>]+$/.test((a && a.uri) || '') ? a.uri : '' })) } : null;
+    const image = gimage || (im && im.provider !== 'google' && /^https:\/\/(upload|thumb)\.wikimedia\.org\/[^\s"'<>]+$/.test(im.src || '') && txt(im.license, 40)
+      ? { src: im.src, page: /^https:\/\/commons\.wikimedia\.org\/[^\s"'<>]+$/.test(im.page || '') ? im.page : '', credit: 'Wikimedia Commons',
+          author: txt(im.author, 80) || '작자 미상', license: txt(im.license, 40),
+          licenseUrl: /^https?:\/\/[^\s"'<>]+$/.test(im.license_url || '') ? im.license_url : '' } : null);
     return { state: 'found', name, url: src.url, provider: prov, label: RESEARCH_PROVIDER[prov][0], license: RESEARCH_PROVIDER[prov][1],
-             km: Number.isFinite(d.distance_km) ? d.distance_km : null };
+             km: Number.isFinite(d.distance_km) ? d.distance_km : null, address,
+             addressSource: typeof d.address_source === 'string' && address ? d.address_source.slice(0, 60) : '',
+             lat: Number.isFinite(d.lat) ? d.lat : null, lon: Number.isFinite(d.lon) ? d.lon : null, image };
   }
   /* 조사 보고서 → 화면 장소. 종류(관광지 / 맛집·카페)마다 기본 caps 개 + 후보 2개(genReport 와 같은 규칙),
      '다시 생성'(round)은 순위를 2칸씩 돌린다(추가 호출 없음). 도시 순서는 요청 순서(idx)로 맞춘다. */
@@ -810,7 +897,7 @@
     inAppBrowser, WEAK_KEY, CONSENT_KEY, CONSENT_VERSION, loadConsent, saveConsent, withdrawConsent, WEAK_THRESHOLD, HEARD_MATCH_MIN, heardCoverage, MAX_AUDIO_BYTES, GEN_TIMEOUT_MS,
     TRIP_KEY, cleanTrip, loadTrip, saveTrip, preferTrip,
     categoryOfKind,
-    calendarToday, itineraryRequestBody, kindFromPrimary, foldItinerary, placeBlocksOnDays, collectItinerary,
+    calendarToday, phonemeNotes, acousticNote, wordMarks, phonemeGroups, speakVerdict, itineraryRequestBody, kindFromPrimary, foldItinerary, placeBlocksOnDays, collectItinerary,
     RESEARCH_TIMEOUT_MS, researchRequestBody, collectResearch, researchPlace, foldResearch, placeCheckResult, vocabSentences, placeVocab,
     apiBase, normalizeAiResponse, buildPools, takeForPlace, generateByCity,
     cleanWeak, upsertWeak, loadWeak, saveWeak, scopedStorage, weakIdsFor, weakReviewOf, weakDecision, shouldSaveWeak, extFor, speakCheck,

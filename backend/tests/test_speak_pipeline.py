@@ -9,7 +9,9 @@ from __future__ import annotations
 import io
 import json
 import os
+import time
 import unittest
+from unittest import mock
 import wave
 from pathlib import Path
 from types import SimpleNamespace
@@ -288,6 +290,42 @@ class SttTest(Base):
         self.assertIn("peanut", d["fix_one"])
         self.assertEqual(gem.texts, [])
 
+    def test_slow_feedback_falls_back_to_template_at_deadline(self) -> None:
+        # 피드백이 상한(SPEAK_FEEDBACK_DEADLINE)을 넘기면 틀 문장으로 바로 답하고, 남은 시도는 부르지 않는다
+        os.environ["SPEAK_FEEDBACK_DEADLINE"] = "2"
+
+        def slow_bad(_n: int) -> str:
+            time.sleep(0.4)
+            return "not json"
+        _, gem = self.install({"groq": lambda n: Resp(200, stt_ok("I have a allergy"))}, feedback=slow_bad)
+        t0 = time.monotonic()
+        _, d = self.speak(GOOD)
+        self.assertLess(time.monotonic() - t0, 6)
+        self.assertTrue(d["usable"])
+        self.assertEqual((d["feedback"]["source"], d["feedback"]["error_code"]), ("template", "deadline"))
+        self.assertEqual(d["feedback"]["deadline_s"], 2.0)
+        self.assertIn("peanut", d["fix_one"])
+        time.sleep(0.6)                                     # 진행 중이던 한 번은 끝나게 둔다
+        n = len(gem.texts)
+        time.sleep(1.0)
+        self.assertEqual(len(gem.texts), n)                 # 취소 뒤 더 부르지 않는다
+        self.assertLess(n, 10)
+
+    def test_feedback_reports_failed_attempts(self) -> None:
+        # 몇 번째 시도에 왜 실패했는지 응답에 남긴다(지연 원인 진단용)
+        _, gem = self.install({"groq": lambda n: Resp(200, stt_ok("I have a allergy"))},
+                              feedback=lambda n: "not json" if n == 1 else fb_ok(n))
+        _, d = self.speak(GOOD)
+        self.assertEqual((d["feedback"]["source"], d["feedback"]["attempts"]), ("ai", 2))
+        self.assertEqual(len(d["feedback"]["failures"]), 1)
+        self.assertEqual(len(gem.texts), 2)
+
+    def test_deadline_env_is_clamped(self) -> None:
+        for raw, want in (("", 8.0), ("abc", 8.0), ("0.5", 2.0), ("999", 60.0), ("8", 8.0)):
+            with self.subTest(raw):
+                os.environ["SPEAK_FEEDBACK_DEADLINE"] = raw
+                self.assertEqual(main.speak_feedback_deadline(), want)
+
 
 class HallucinationFilterTest(Base):
     def test_high_no_speech_prob_dropped_then_no_speech(self) -> None:
@@ -500,6 +538,87 @@ class CrossValidationTest(Base):
         self.assertIs(d["cross_validated"], True)
         self.assertNotIn("limited", d)
         self.assertIsInstance(d["score"], int)
+
+    def test_phonemes_attached_when_cross_validated(self) -> None:
+        fake, _ = self.install(self.ok())
+        _, d = self.speak(GOOD)
+        ph = d["phonemes"]
+        self.assertEqual(ph["basis"], "transcript")          # 받아쓴 글자 기준이라는 표시
+        self.assertEqual(ph["per"], 0)
+        self.assertEqual([w["word"] for w in ph["words"]], ["i", "have", "a", "peanut", "allergy"])
+
+    def test_phoneme_diff_only_when_both_transcripts_agree(self) -> None:
+        fake, _ = self.install({"groq": lambda n: Resp(200, stt_ok("I have a peanuts allergy"))})
+        fake.aai_text = "I have a peanuts allergy"
+        _, d = self.speak(GOOD)
+        w = next(x for x in d["phonemes"]["words"] if x["word"] == "peanut")
+        self.assertEqual(w["status"], "diff")
+        self.assertEqual([(o["op"], o["hyp"], o["hyp_ipa"]) for o in w["ops"] if o["op"] != "eq"], [("ins", "S", "s")])
+
+    def test_phoneme_diff_from_one_transcript_is_unsure(self) -> None:
+        fake, _ = self.install({"groq": lambda n: Resp(200, stt_ok("I have a peanuts allergy"))})
+        fake.aai_text = TARGET
+        _, d = self.speak(GOOD)
+        self.assertEqual(d["phonemes"]["unsure_words"], ["peanut"])
+        self.assertEqual(d["phonemes"]["per"], 0)               # 확실한 단어만 센다
+
+    def test_no_phonemes_in_limited_mode(self) -> None:
+        fake, gem = self.install(self.ok())
+        fake.aai_fail = True
+        _, d = self.speak(GOOD)
+        self.assertTrue(d.get("limited"))
+        self.assertNotIn("phonemes", d)
+
+    def test_phoneme_failure_does_not_break_scoring(self) -> None:
+        fake, _ = self.install(self.ok())
+        with mock.patch.object(main.phonemes, "consensus", side_effect=RuntimeError("boom")):
+            _, d = self.speak(GOOD)
+        self.assertIs(d["cross_validated"], True)
+        self.assertIsNone(d["phonemes"])
+        self.assertIsInstance(d["score"], int)
+
+    def test_no_phoneme_node_no_call(self) -> None:
+        """노드 주소·토큰이 없으면 노드를 부르지 않는다(음성이 새 수신처로 가지 않는다)."""
+        fake, _ = self.install(self.ok())
+        with mock.patch.object(main.acoustic_chain.remote, "analyze") as an:
+            _, d = self.speak(GOOD)
+        an.assert_not_called()
+        self.assertIsNone(d["phonemes_acoustic"])
+
+    def test_phoneme_node_result_attached(self) -> None:
+        fake, _ = self.install(self.ok())
+        got = {"status": "ok", "basis": "acoustic", "via": "remote", "phoneme_accuracy": 95.0,
+               "focus": {"word": "peanut", "ipa": "iː", "heard_as": "ɪ"}}
+        seen = {}
+
+        def analyze(samples, target):
+            seen.update(n=len(samples), target=target)
+            return got
+
+        with mock.patch.dict(os.environ, {"PHONEME_REMOTE_URL": "https://pc.tail1.ts.net", "PHONEME_TOKEN": "t" * 32}), \
+                mock.patch.object(main.acoustic_chain.remote, "analyze", side_effect=analyze):
+            _, d = self.speak(GOOD)
+        self.assertEqual(d["phonemes_acoustic"], got)
+        self.assertEqual(seen["target"], TARGET)
+        self.assertGreater(seen["n"], 16000 * 0.5)          # 디코드한 16k 샘플을 그대로 보낸다
+        self.assertIsInstance(d["score"], int)
+
+    def test_phoneme_node_crash_keeps_scoring(self) -> None:
+        fake, _ = self.install(self.ok())
+        with mock.patch.dict(os.environ, {"PHONEME_REMOTE_URL": "https://pc.tail1.ts.net", "PHONEME_TOKEN": "t" * 32}), \
+                mock.patch.object(main.acoustic_chain.remote, "analyze", side_effect=RuntimeError("boom")):
+            _, d = self.speak(GOOD)
+        self.assertEqual(d["phonemes_acoustic"]["status"], "unavailable")
+        self.assertIsInstance(d["score"], int)
+
+    def test_phoneme_node_not_called_in_limited_mode(self) -> None:
+        fake, _ = self.install(self.ok())
+        fake.aai_fail = True
+        with mock.patch.dict(os.environ, {"PHONEME_REMOTE_URL": "https://pc.tail1.ts.net", "PHONEME_TOKEN": "t" * 32}), \
+                mock.patch.object(main.acoustic_chain.remote, "analyze") as an:
+            _, d = self.speak(GOOD)
+        self.assertTrue(d.get("limited"))
+        an.assert_not_called()
 
     def test_local_detector_reported(self) -> None:
         fake, _ = self.install(self.ok())

@@ -14,6 +14,13 @@ test('apiBase: ?api= 는 저장하지 않고 external 로 표시, file:// 은 �
   const ext = AI.apiBase({ protocol: 'https:', host: 'a.onrender.com', origin: 'https://a.onrender.com', search: '?api=https://evil.example' });
   assert.equal(ext.base, 'https://evil.example'); assert.equal(ext.external, true);
   assert.equal(AI.apiBase({ protocol: 'file:', host: '', origin: 'null', search: '' }).base, null);
+  // Firebase Hosting 에서 열면 화면만 Firebase, API 는 Render(외부 서버 안내 없음). ?api= 가 있으면 그것이 먼저
+  for (const host of ['com-example-myapplicatio-3bb36.web.app', 'com-example-myapplicatio-3bb36.firebaseapp.com']) {
+    assert.deepEqual(AI.apiBase({ protocol: 'https:', host, hostname: host, origin: 'https://' + host, search: '' }),
+      { base: 'https://codyssey-final.onrender.com', external: false, host: 'codyssey-final.onrender.com' }, host);
+  }
+  assert.equal(AI.apiBase({ protocol: 'https:', host: 'x.web.app', hostname: 'x.web.app', origin: 'https://x.web.app', search: '?api=https://evil.example' }).base, 'https://evil.example');
+  assert.equal(AI.apiBase({ protocol: 'https:', host: 'web.app.evil.example', hostname: 'web.app.evil.example', origin: 'https://web.app.evil.example', search: '' }).base, '');
   assert.equal(AI.apiBase({ protocol: 'file:', host: '', origin: 'null', search: '?api=javascript:alert(1)' }).base, null);
   assert.equal(AI.apiBase({ protocol: 'https:', host: 'a', origin: 'https://a', search: '?api=ftp://x' }).base, '');
 });
@@ -418,6 +425,60 @@ test('calendarToday: 로컬 연월일이고 UTC 문자열로 바꾸지 않는다
   assert.doesNotMatch(String(AI.calendarToday), /toISOString/);
 });
 
+test('phonemeNotes: 두 받아쓰기가 같은 차이를 낸 단어만, 받아쓴 글자 기준임을 밝힌다', () => {
+  const op = (o, r, h, ri, hi) => ({ op: o, ref: r, hyp: h, ref_ipa: ri, hyp_ipa: hi });
+  const ph = { basis: 'transcript', words: [
+    { word: 'a', status: 'ok' },
+    { word: 'seat', status: 'diff', ops: [op('eq', 'S', 'S', 's', 's'), op('sub', 'IY', 'IH', 'i', 'ɪ'), op('eq', 'T', 'T', 't', 't')] },
+    { word: 'peanut', status: 'diff', ops: [op('eq', 'T', 'T', 't', 't'), op('ins', null, 'S', '', 's')] },
+    { word: 'sightseeing', status: 'diff', ops: [op('del', 'S', null, 's', ''), op('del', 'IY', null, 'i', '')] },
+    { word: 'please', status: 'unsure' },
+  ] };
+  assert.equal(AI.phonemeNotes(ph), '소리 차이(받아쓴 글자 기준): seat /i/→/ɪ/ · peanut /s/ 더해짐 · sightseeing /s/ 빠짐 /i/ 빠짐');
+  assert.equal(AI.phonemeNotes(ph, 1), '소리 차이(받아쓴 글자 기준): seat /i/→/ɪ/');
+  assert.equal(AI.phonemeNotes({ ...ph, basis: 'acoustic' }, 1), '소리 차이: seat /i/→/ɪ/');
+  assert.equal(AI.phonemeNotes({ basis: 'transcript', words: [{ word: 'a', status: 'ok' }, { word: 'b', status: 'unsure' }] }), '');
+  assert.equal(AI.phonemeNotes(null), '');
+  assert.equal(AI.phonemeNotes({}), '');
+});
+
+test('acousticNote: 음소 노드 결과(실제 소리) — 가장 약한 음소 하나와 안내, 없으면 빈 문자열', () => {
+  const pa = { status: 'ok', basis: 'acoustic', phoneme_accuracy: 95,
+    focus: { word: 'seat', ipa: 'iː', heard_as: 'ɪ', tip: '입꼬리를 옆으로 당기고 길게.' } };
+  assert.equal(AI.acousticNote(pa), "소리 분석(실제 음성): 'seat'의 /iː/가 /ɪ/처럼 들렸어요 — 입꼬리를 옆으로 당기고 길게.");
+  assert.equal(AI.acousticNote({ ...pa, focus: { word: 'seat', ipa: 'iː' } }), "소리 분석(실제 음성): 'seat'의 /iː/ 소리가 약했어요");
+  assert.equal(AI.acousticNote({ status: 'ok', phoneme_accuracy: 100, focus: null }), '소리 분석(실제 음성): 목표 음소 100%가 들렸어요');
+  for (const bad of [null, undefined, {}, { status: 'unavailable', reason: 'URLError' }, { status: 'disabled' }]) assert.equal(AI.acousticNote(bad), '');
+});
+
+test('wordMarks: 두 받아쓰기 모두에서 안 들린 단어만 표시, 원문 글자 유지, 같은 단어는 앞에서부터', () => {
+  const m = AI.wordMarks('Can I have a window seat, please?', ['seat']);
+  assert.deepEqual(m.filter(x => x.miss).map(x => x.w), ['seat,']);
+  assert.equal(m.length, 7);
+  assert.deepEqual(AI.wordMarks('a seat and a seat', ['seat']).map(x => x.miss), [false, true, false, false, false]);
+  assert.deepEqual(AI.wordMarks("I'd like it", ["i'd"]).map(x => x.miss), [true, false, false]);
+  assert.deepEqual(AI.wordMarks('', ['x']), []);
+  assert.deepEqual(AI.wordMarks('hello there', null).map(x => x.miss), [false, false]);
+});
+
+test('phonemeGroups: 연속한 같은 단어끼리 묶고, 형식이 틀린 행은 버린다', () => {
+  const g = AI.phonemeGroups([{ ipa: 's', word: 'seat', status: 'ok' }, { ipa: 'iː', word: 'seat', status: 'missing' },
+    { ipa: 'p', word: 'please', status: 'weak' }, { ipa: 'x', word: 'q', status: 'bogus' }, null, { word: 'z', status: 'ok' }]);
+  assert.deepEqual(g.map(x => [x.word, x.items.length]), [['seat', 2], ['please', 1]]);
+  assert.deepEqual(AI.phonemeGroups(undefined), []);
+});
+
+test('speakVerdict: 음소 결과가 있으면 소리로, 없으면 단어로 — 발음 점수라는 말은 쓰지 않는다', () => {
+  const ok = { status: 'ok' }, bad = { status: 'missing' }, weak = { status: 'weak' };
+  assert.equal(AI.speakVerdict(100, [ok, ok]).tone, 'ok');
+  assert.equal(AI.speakVerdict(100, [ok, bad]).text, '한두 소리만 고치면 돼요');
+  assert.equal(AI.speakVerdict(100, [bad, bad, weak]).text, '소리를 몇 개 더 다듬어 봐요');
+  assert.equal(AI.speakVerdict(95, []).text, '단어를 모두 알아들었어요');
+  assert.equal(AI.speakVerdict(70, []).tone, 'mid');
+  assert.equal(AI.speakVerdict(30, []).tone, 'low');
+  for (const s of [0, 50, 100]) assert.doesNotMatch(AI.speakVerdict(s, []).text + AI.speakVerdict(s, [ok]).text, /발음 점수|점$/);
+});
+
 test('itineraryRequestBody: 세 종류를 보내고 14일을 넘는 구간도 자르지 않는다', () => {
   const body = AI.itineraryRequestBody({ name: '뉴욕', start: '2026-10-16', end: '2026-11-04' });
   assert.equal(body.city, '뉴욕');
@@ -726,6 +787,31 @@ test('직접 추가 장소 확인 응답: found 만 링크·이름을 싣고, ht
   assert.equal(AI.placeCheckResult({ status: 'found', name: '<b>', source: { url: 'https://a.b' } }).state, 'error');
   assert.equal(AI.placeCheckResult(null).state, 'error');
   assert.equal(AI.placeCheckResult({ status: 'found', name: 'G', source: { provider: 'google', url: 'https://maps.google.com/?cid=1' } }).label, 'Google 지도');
+});
+
+test('장소 확인 창 응답(11/05): 주소는 글자만, 사진은 위키미디어 공용 썸네일만, 좌표는 숫자만', () => {
+  const base = { status: 'found', name: 'Tōdai-ji Temple', source: { provider: 'wikidata', url: 'https://www.wikidata.org/wiki/Q186148' } };
+  const ok = AI.placeCheckResult({ ...base, lat: 34.689, lon: 135.8398, address: ' 406-1  Zoshicho <b>Nara</b> ', address_source: 'OpenStreetMap (ODbL)',
+    image: { src: 'https://upload.wikimedia.org/wikipedia/commons/thumb/a/ab/T.jpg/500px-T.jpg', page: 'https://commons.wikimedia.org/wiki/File:T.jpg',
+             author: ' Kim <b>Lee</b> ', license: 'CC BY-SA 4.0', license_url: 'https://creativecommons.org/licenses/by-sa/4.0' } });
+  assert.deepEqual([ok.address, ok.addressSource, ok.lat, ok.lon], ['406-1 Zoshicho b Nara /b', 'OpenStreetMap (ODbL)', 34.689, 135.8398]);
+  assert.deepEqual(ok.image, { src: 'https://upload.wikimedia.org/wikipedia/commons/thumb/a/ab/T.jpg/500px-T.jpg', page: 'https://commons.wikimedia.org/wiki/File:T.jpg',
+    credit: 'Wikimedia Commons', author: 'Kim b Lee /b', license: 'CC BY-SA 4.0', licenseUrl: 'https://creativecommons.org/licenses/by-sa/4.0' });
+  // 저작자·라이선스 표시 요건 — 라이선스가 없으면 사진을 쓰지 않는다. 공용 API 의 thumb 호스트는 받는다
+  assert.equal(AI.placeCheckResult({ ...base, image: { src: 'https://upload.wikimedia.org/a.jpg' } }).image, null);
+  assert.equal(AI.placeCheckResult({ ...base, image: { src: 'https://thumb.wikimedia.org/a.jpg', license: 'CC0' } }).image.author, '작자 미상');
+  for (const src of ['http://upload.wikimedia.org/a.jpg', 'https://evil.example/a.jpg', 'https://upload.wikimedia.org/a b.jpg', 'javascript:alert(1)']) {
+    assert.equal(AI.placeCheckResult({ ...base, image: { src, license: 'CC0' } }).image, null, src);
+  }
+  // Google 사진(무료 사진이 없을 때): 화면이 바로 부르는 googleusercontent 주소 + 찍은 사람. 다른 호스트는 버린다
+  const g = AI.placeCheckResult({ ...base, image: { provider: 'google', src: 'https://lh3.googleusercontent.com/p/A=s500',
+    authors: [{ name: 'Kim <b>', uri: 'https://maps.google.com/maps/contrib/1' }, { name: '', uri: 'javascript:x' }] } });
+  assert.deepEqual(g.image, { src: 'https://lh3.googleusercontent.com/p/A=s500', provider: 'google', credit: 'Google 지도',
+    authors: [{ name: 'Kim b', uri: 'https://maps.google.com/maps/contrib/1' }, { name: 'Google 사용자', uri: '' }] });
+  assert.equal(AI.placeCheckResult({ ...base, image: { provider: 'google', src: 'https://evil.example/a.jpg' } }).image, null);
+  assert.equal(AI.placeCheckResult({ ...base, image: { provider: 'google', src: 'https://upload.wikimedia.org/a.jpg', license: 'CC0' } }).image, null);
+  const bare = AI.placeCheckResult({ ...base, lat: 'x' });
+  assert.deepEqual([bare.address, bare.image, bare.lat, bare.addressSource], ['', null, null, '']);
 });
 
 /* ---------- 장소 어휘 슬롯 문장 (PR-V2): 골든 + 속성 ---------- */
